@@ -55,10 +55,10 @@ def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bo
     if use_nemo_manifest:
         if config.get("manifest_filepath") is None:
             raise IncompleteConfigError("You must specify either: manifest_filepath, cuts_path, or shar_path")
-        cuts, is_tarred = read_nemo_manifest(config)
+        cuts, is_tarred, weights = read_nemo_manifest(config)
     else:
         cuts, is_tarred = read_lhotse_manifest(config)
-    return cuts, is_tarred
+    return cuts, is_tarred, weights
 
 
 class IncompleteConfigError(RuntimeError):
@@ -532,6 +532,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
                 cuts = cuts.repeat()
         else:
             cuts = CutSet(LazyNeMoIterator(config.manifest_filepath, **notar_kwargs, **common_kwargs))
+            weights = [len(cuts)]
     else:
         # Format option 1:
         #   Assume it's [[path1], [path2], ...] (same for tarred_audio_filepaths).
@@ -607,7 +608,7 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
             seed=config.shard_seed,
             force_finite=force_finite or metadata_only,
         )
-    return cuts, is_tarred
+    return cuts, is_tarred, weights
 
 
 def mux(
