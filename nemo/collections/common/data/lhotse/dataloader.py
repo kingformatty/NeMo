@@ -465,7 +465,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, use_iterable_dataset, weights = read_cutset_from_config(config)
     use_iterable_dataset = determine_use_iterable_dataset(use_iterable_dataset, config)
-    import ipdb; ipdb.set_trace()
     if config.generators is not None:
         #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
         generated_cuts = CutSet()
