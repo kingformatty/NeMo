@@ -463,7 +463,7 @@ def get_lhotse_dataloader_from_multi_config(
 def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=None) -> tuple[CutSampler, bool]:
     """Create a CutSampler from a dataloader config."""
     # 1. Load a manifest as a Lhotse CutSet.
-    cuts, use_iterable_dataset, weights = read_cutset_from_config(config)
+    cuts, use_iterable_dataset = read_cutset_from_config(config)
     use_iterable_dataset = determine_use_iterable_dataset(use_iterable_dataset, config)
     if config.generators is not None:
         #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
@@ -490,7 +490,7 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
                     generated_cuts += generator.generate(cuts_for_generation)
         if config.including_real_data:
             # cuts = CutSet.from_cuts(cuts + generated_cuts)
-            cuts = mux(cuts, generated_cuts, weights = [sum(weights), len(generated_cuts)])
+            cuts = mux(cuts, generated_cuts)
         else:
             cuts = generated_cuts
 
@@ -544,7 +544,8 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
         if config.including_real_data:
             # cuts = CutSet.from_cuts(cuts + simulated_cuts)
             # only support uniform sampling, self-defined sampling TODO
-            cuts = mux(cuts, simulated_cuts, weights = [sum(weights), len(simulated_cuts)])
+            #determines weights out side of read_cutset_from_config function to maintain function consistency
+            cuts = mux(cuts, simulated_cuts)
         else:
             cuts = simulated_cuts
 
@@ -880,7 +881,8 @@ def _merge_supervisions(cuts: CutSet) -> CutSet:
 
 def _flatten_alt_text(cut) -> list:
     ans = [cut]
-    if not isinstance(cut, Cut) or cut.custom is None or cut.custom.get("alt_text") is None:
+    if not isinstance(cut, Cut) or (not hasattr(cut, 'custom') or cut.custom is None) or cut.custom.get("alt_text") is None:
+        return ans
         return ans
     cut = cut.move_to_memory(audio_format="wav")  # performs I/O once and holds audio in memory from now on
     # Popping to ease eyesight on debug.

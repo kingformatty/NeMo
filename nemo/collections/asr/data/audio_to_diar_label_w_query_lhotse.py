@@ -28,7 +28,8 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
 from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import (
     get_separator_audio,
     get_query_cut,
-    speaker_to_target_w_query
+    speaker_to_target_w_query,
+    mix_noise
 )
 
 
@@ -78,14 +79,15 @@ class LhotseAudioToSpeechE2ESpkDiarWQueryDataset(torch.utils.data.Dataset):
             self.query_noise_mix_prob = self.cfg.get('query_noise_mix_prob', 0.3)
             self.query_snr = tuple(self.cfg.get('query_snr',(2.5, 12.5)))
 
-    def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:        
+    def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         query_cuts = CutSet.from_cuts(get_query_cut(c) for c in cuts)
         if self.query_noise_path:
-            query_cuts = query_cuts.mix(self.query_noise_cut, 
-                                        preserve_id = 'left',
-                                        snr = self.query_snr,
-                                        mix_prob = self.query_noise_mix_prob,
-                                        random_mix_offset = True)
+            query_cuts = mix_noise(
+                query_cuts,
+                self.query_noise_cut,
+                snr = self.query_snr,
+                mix_prob = self.query_noise_mix_prob,
+            )
         spk_targets = [torch.transpose(torch.as_tensor(speaker_to_target_w_query(
             c, q, 
             self.add_separater_audio,
@@ -116,5 +118,6 @@ class LhotseAudioToSpeechE2ESpkDiarWQueryDataset(torch.utils.data.Dataset):
                 audio_len, self.num_sample_per_mel_frame, self.num_mel_frame_per_asr_frame
             )
             target_lens_list.append(target_fr_len)
+        import ipdb; ipdb.set_trace()
         target_lens = torch.tensor(target_lens_list)
         return audio, audio_lens, spk_targets, target_lens

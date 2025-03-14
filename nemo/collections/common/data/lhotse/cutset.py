@@ -38,6 +38,9 @@ from nemo.collections.common.data.lhotse.text_adapters import (
 )
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import MultiSpeakerSimulator
+from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import TargetSpeakerSimulator
+
 
 def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bool]:
     """
@@ -55,10 +58,10 @@ def read_cutset_from_config(config: Union[DictConfig, dict]) -> Tuple[CutSet, bo
     if use_nemo_manifest:
         if config.get("manifest_filepath") is None:
             raise IncompleteConfigError("You must specify either: manifest_filepath, cuts_path, or shar_path")
-        cuts, is_tarred, weights = read_nemo_manifest(config)
+        cuts, is_tarred = read_nemo_manifest(config)
     else:
         cuts, is_tarred = read_lhotse_manifest(config)
-    return cuts, is_tarred, weights
+    return cuts, is_tarred
 
 
 class IncompleteConfigError(RuntimeError):
@@ -608,7 +611,35 @@ def read_nemo_manifest(config) -> tuple[CutSet, bool]:
             seed=config.shard_seed,
             force_finite=force_finite or metadata_only,
         )
-    return cuts, is_tarred, weights
+    return cuts, is_tarred
+
+@data_type_parser("multi_speaker_simulator")
+def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
+        
+    multi_speaker_cuts = CutSet(
+        MultiSpeakerSimulator(
+            manifest_filepath=config.manifest_filepath,
+            num_speakers=config.num_speakers,
+            simulator_type=config.simulator_type,
+            min_delay=config.get("min_delay", 0.5),
+        )
+    )
+
+    return multi_speaker_cuts, False
+
+@data_type_parser("tgt_speaker_simulator")
+def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
+        
+    tgt_speaker_cuts = CutSet(
+        TargetSpeakerSimulator(
+            manifest_filepath=config.manifest_filepath,
+            num_speakers=config.num_speakers,
+            simulator_type=config.simulator_type,
+            min_delay=config.get("min_delay", 0.5),
+        )
+    )
+
+    return tgt_speaker_cuts, False
 
 
 def mux(
