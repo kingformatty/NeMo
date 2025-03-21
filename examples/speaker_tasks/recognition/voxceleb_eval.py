@@ -54,10 +54,10 @@ def get_acc(trial_file='', emb='', save_kaldi_emb=False):
             line = line.strip()
             truth, x_speaker, y_speaker = line.split()
 
-            x_speaker = x_speaker.split('/')
+            x_speaker = x_speaker.split('/')[-3:]
             x_speaker = '@'.join(x_speaker)
 
-            y_speaker = y_speaker.split('/')
+            y_speaker = y_speaker.split('/')[-3:]
             y_speaker = '@'.join(y_speaker)
 
             X = emb[x_speaker]

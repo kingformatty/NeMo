@@ -24,14 +24,16 @@ from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource
 from lhotse.utils import uuid4, compute_num_samples
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_hidden_length_from_sample_length,
-    find_segments_from_rttm
+    find_segments_from_rttm,
+    json_to_cut,
+    get_bounded_segment
 )
 
 from lhotse.lazy import LazyIteratorChain, LazyJsonlIterator
 
 def mix_noise(
     cuts,
-    noise_cut,
+    noise_manifests,
     snr,
     mix_prob,
 ):
@@ -42,9 +44,11 @@ def mix_noise(
         if random.uniform(0.0, 1.0) > mix_prob or cut.duration == 0:
             mixed_cuts.append(cut)
             continue
-        to_mix = noise_cut.sample()
+        to_mix_manifest = random.choice(noise_manifests)
+        to_mix_cut = json_to_cut(to_mix_manifest)
+        to_mix_cut = to_mix_cut.resample(16000)
         snr = random.uniform(*snr) if isinstance(snr, (list, tuple)) else snr
-        mixed = cut.mix(to_mix, snr = snr)
+        mixed = cut.mix(to_mix_cut, snr = snr)
         mixed = mixed.truncate(duration=cut.duration)
         mixed_cuts.append(mixed) 
     return CutSet.from_cuts(mixed_cuts)
@@ -297,280 +301,6 @@ def get_query_cut(cut):
                             recording = query_rec,
                             supervisions = query_sups)
         return query_cut
-    
-class LibriSpeechMixGenerator_tgt():
-    def __init__(self):
-        pass
-
-    def generate(self, cuts):
-        cut_set = []
-        for cut in tqdm(cuts, desc=f"Generating speaker intra-session mixtures", ncols=128):
-            offsets = cut.delays
-            durations = cut.durations
-            wavs = cut.wavs
-            text = cut.text
-            query_audio_filepath = cut.query_audio_filepath
-            query_speaker_id = cut.query_speaker_id
-            query_offset = cut.query_offset
-            query_duration = cut.query_duration
-            rttm_filepath = cut.rttm_filepath
-            # speakers = cut.speakers
-
-            tracks = []
-            for i, (offset, duration, wav) in enumerate(zip(offsets, durations, wavs)):
-                custom = {
-                        'pnc': 'no',
-                        'source_lang': 'en',
-                        'target_lang': 'en',
-                        'task': 'asr',
-                        'speaker_id': wav.split('/')[-1].split('-')[0]
-                    }
-                wav_dur = soundfile.info(wav).duration
-                wav_samples = soundfile.info(wav).frames
-                cut_1spk = MonoCut(
-                    id=wav.split('/')[-1].replace('.wav', ''),
-                    start=0,
-                    duration=duration,
-                    channel=0,
-                    supervisions=[],
-                    recording=Recording(
-                        id=cut.rttm_filepath.split('/')[-1].replace('.rttm',''),
-                        sources=[
-                            AudioSource(
-                                type='file',
-                                channels=[0],
-                                source=wav
-                            )
-                        ],
-                        sampling_rate=16000, 
-                        num_samples=wav_samples,
-                        duration=wav_dur
-                    ),
-                    custom = custom
-                )
-                tracks.append(MixTrack(cut=deepcopy(cut_1spk), type=type(cut_1spk), offset=offset))
-
-            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
-            #modify monocut's recording id for further rttm reading
-            sup = SupervisionSegment(
-                id= mixed_cut.id,
-                recording_id=mixed_cut.id,
-                start=0,
-                duration=mixed_cut.duration,
-                text=cut.text,
-            )
-            mixed_cut.tracks[0].cut.supervisions = [sup]
-            custom = {
-                    'query_audio_filepath': query_audio_filepath,
-                    'query_speaker_id': query_speaker_id,
-                    'query_offset': query_offset,
-                    'query_duration': query_duration,
-                    'rttm_filepath': rttm_filepath,
-                    'custom': None
-                }
-            mixed_cut.tracks[0].cut.custom.update(custom)
-            cut_set.append(mixed_cut)
-        
-        return CutSet.from_cuts(cut_set)
-    
-
-class LibriSpeechMixSimulator_tgt():
-
-    def __init__(
-        self,
-        data_type: str = "msasr",
-        min_delay: float = 0.5,
-        max_num_speakers: int = 4,
-        speaker_count_distribution: List[float] = [0, 2, 3, 4],
-        query_duration: List[float] = [1, 10],
-        delay_factor: int = 1
-    ):
-        """
-        Args:
-        data_type: the type of data to simulate. Either 'msasr', 'tsasr' or 'diar'. [Default: 'msasr']
-        min_delay: the minimum delay between the segments. [Default: 0.5]
-        max_num_speakers: the maximum number of speakers in the meeting. [Default: 4]
-        speaker_token_position: the position of the speaker token in the text. Either 'sot', 'word', or 'segments'. [Default: 'sot']
-        speaker_count_distribution: the speaker count distribution for the simulated meetings. [Default: [0, 2, 3, 4]]
-        query_duration: the min and max query duration for the simulated meetings. [Default: [1, 10]]
-        delay_factor: the number of times to repeat the meeting with the same speakers. [Default: 1]
-        """
-        super().__init__()
-        self.data_type = data_type
-        self.min_delay = min_delay
-        self.delay_factor = delay_factor
-        self.max_num_speakers = max_num_speakers
-        self.speaker_count_distribution = speaker_count_distribution
-        self.query_duration = query_duration
-        assert len(speaker_count_distribution) == max_num_speakers, f"Length of speaker_count_distribution {len(speaker_count_distribution)} must be equal to max_num_speakers {max_num_speakers}"
-        assert len(query_duration) == 2, f"set query duration to be [min, max] in s"
-
-    def fit(self, cuts) -> CutSet:
-        self.speaker_id2cut_ids = defaultdict(list)
-        self.id2cuts = defaultdict(list)
-        for cut in tqdm(cuts, desc="Reading segments", ncols=100):
-            # if not hasattr(cut, 'dataset_id') or cut.dataset_id != 'librispeech':
-            #     continue
-            if hasattr(cuts[0], 'speaker_id'):
-                speaker_id = cut.speaker_id
-            else: #LibriSpeech
-                speaker_id = cut.recording_id.split('-')[0]
-                cut.speaker_id = speaker_id
-            self.speaker_id2cut_ids[speaker_id].append(cut.id)
-            self.id2cuts[cut.id] = cut
-        
-        self.speaker_ids = list(self.speaker_id2cut_ids.keys())
-
-    def _create_mixture(self, n_speakers: int, non_query_sample = False) -> MixedCut:
-        sampled_speaker_ids = random.sample(self.speaker_ids, n_speakers)
-        
-        mono_cuts = []
-        cut_ids = []
-        for speaker_id in sampled_speaker_ids:
-            cut_id = random.choice(self.speaker_id2cut_ids[speaker_id])
-            cut = self.id2cuts[cut_id]
-            mono_cuts.append(cut)
-            cut_ids.append(cut_id)
-
-        mixed_cuts = []
-        if n_speakers == 1:
-            #do not add delay factor to single-spk sample as augmented one will be the same
-            delay_factor = 1
-        else:
-            delay_factor = self.delay_factor
-        for i in range(delay_factor):
-            tracks = []
-            offset = 0.0
-            for mono_cut in mono_cuts:
-                custom = {
-                        'pnc': 'no',
-                        'source_lang': 'en',
-                        'target_lang': 'en',
-                        'task': 'asr'
-                    }
-                mono_cut.custom.update(custom)
-                tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
-                offset += random.uniform(self.min_delay, mono_cut.duration)
-        
-            mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
-
-            if self.data_type == "tsasr":
-                if non_query_sample:
-                    query_speaker_id = random.sample(set(self.speaker_ids) - set(sampled_speaker_ids), 1)[0]
-                    query_cut_list = self.speaker_id2cut_ids[query_speaker_id]
-                else:
-                    index = random.randrange(len(sampled_speaker_ids))
-                    query_speaker_id = sampled_speaker_ids[index]
-                    query_cut_list = deepcopy(self.speaker_id2cut_ids[query_speaker_id])
-                    query_cut_list.remove(cut_ids[index])
-                if len(query_cut_list) == 0:
-                    #no query utterance different from target utterance is found
-                    return mixed_cuts
-                query_id = random.choice(query_cut_list)
-                query_cut = self.id2cuts[query_id]
-                text = self.get_text(mixed_cut, query_speaker_id) if not non_query_sample else ""
-                sup = SupervisionSegment(id = mixed_cut.id, recording_id = mixed_cut.id, start = 0, duration=mixed_cut.duration, text = text)
-                query_offset, query_duration = self.get_bounded_segment(query_cut.start, query_cut.duration, min_duration=self.query_duration[0], max_duration=self.query_duration[1])
-                custom = {
-                        'pnc': 'no',
-                        'source_lang': 'en',
-                        'target_lang': 'en',
-                        'task': 'asr',
-                        'query_audio_filepath': query_cut.recording.sources[0].source,
-                        'query_speaker_id': query_speaker_id,
-                        'query_offset': query_offset,
-                        'query_duration': query_duration,
-                        'query_rttm_filepath': query_cut.rttm_filepath if hasattr(query_cut, 'rttm_filepath') else None,
-                        'custom': None 
-                    }
-                mixed_cut.tracks[0].cut.supervisions = [sup]
-                mixed_cut.tracks[0].cut.custom.update(custom)
-
-            mixed_cuts.append(mixed_cut)
-
-        return mixed_cuts
-    
-    # TODO: text is necessary for msasr and tsasr, but not for diar
-    def get_text(self, cut: MixedCut, query_speaker_id) -> str:
-        for i, track in enumerate(cut.tracks):
-            if track.cut.speaker_id == query_speaker_id:
-                return track.cut.text
-        return ValueError ('Error in finding query speaker in target utterance')
-        
-    def get_bounded_segment(self, start_time, total_duration, min_duration=1.0, max_duration=10.0):
-        """
-        Generate a segment within an audio clip with bounded duration.
-        
-        Args:
-            start_time (float): Start time of the audio in seconds
-            total_duration (float): Total duration of the audio in seconds
-            min_duration (float): Minimum allowed segment duration in seconds
-            max_duration (float): Maximum allowed segment duration in seconds
-        
-        Returns:
-            tuple: (segment_start, segment_duration)
-        """
-        import random
-        # Ensure max_duration doesn't exceed total_duration
-        max_duration = min(max_duration, total_duration)
-        
-        # Ensure min_duration is not greater than max_duration
-        min_duration = min(min_duration, max_duration)
-        
-        # Generate random duration within bounds
-        segment_duration = np.round(random.uniform(min_duration, max_duration), decimals=3)
-        
-        # Calculate maximum possible start time
-        max_start = total_duration - segment_duration
-        
-        # Generate random start time
-        segment_start = np.round(random.uniform(start_time, start_time + max_start), decimals=3)
-        
-        return segment_start, segment_duration
-    
-
-    def apply_speaker_distribution(self, num_meetings: int, speaker_count_distribution) -> Dict[int, int]:
-        """
-        Balance the speaker distribution for the simulated meetings.
-        Args:
-            num_meetings: The total number of simulated meetings.
-            speaker_count_distribution: The speaker count distribution for the simulated meetings.
-        For each number of speakers, calculate the number of meetings needed to balance the distribution.
-        """
-
-        total_spk = sum(speaker_count_distribution)
-        num_speakers2num_meetings = {}
-        for i_spk in range(self.max_num_speakers):
-            num_speakers2num_meetings[i_spk+1] = round(num_meetings * speaker_count_distribution[i_spk] / total_spk)
-
-        return num_speakers2num_meetings
-            
-    def simulate(self, 
-        cuts: CutSet,
-        num_meetings: int = 10000,
-        non_existing_query_ratio: float = 0,
-        seed: int = 0,
-        num_jobs: int = 1,
-    ) -> CutSet:
-        random.seed(seed)
-
-        self.fit(cuts)
-
-        self.num_speakers2num_meetings = self.apply_speaker_distribution(num_meetings, self.speaker_count_distribution)
-
-        cut_set = []
-        for n_speakers, n_mt in self.num_speakers2num_meetings.items():
-            if n_mt <= 0:
-                continue
-            for i in tqdm(range(n_mt), desc=f"Simulating {n_speakers}-speaker mixtures", ncols=128):
-                cut_set.extend(self._create_mixture(n_speakers=n_speakers))
-        if non_existing_query_ratio > 0:
-            #add samples where query speaker not in target utterance and set text field to be empty straing
-            num_no_query_samples = int(num_meetings * non_existing_query_ratio)
-            for i in tqdm(range(num_no_query_samples), desc=f"Simulating non existing query samples", ncols=128):
-                cut_set.extend(self._create_mixture(n_speakers=np.random.choice(np.arange(1, self.max_num_speakers+1)), non_query_sample=True))           
-        return CutSet.from_cuts(cut_set).shuffle()
-    
 class TargetSpeakerSimulator():
     """
     This class is used to simulate multi-speaker audio data,
@@ -637,7 +367,7 @@ class TargetSpeakerSimulator():
         mono_cuts = []
         for speaker_id in sampled_speaker_ids:
             manifest = random.choice(self.spk2manifests[speaker_id])
-            mono_cuts.append(self.json_to_cut(manifest))
+            mono_cuts.append(json_to_cut(manifest))
 
         tracks = []
         offset = 0.0
@@ -649,6 +379,11 @@ class TargetSpeakerSimulator():
                     'task': 'asr'
                 }
             mono_cut.custom.update(custom)
+            #select random start time and duration for each speaker according to min and max duration
+            start_time, duration = get_bounded_segment(mono_cut.start, mono_cut.duration, min_duration = 0, max_duration = 20)
+            mono_cut.start = start_time
+            mono_cut.duration = duration
+            #TODO extract mono cut text according to start and duration
             tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
             offset += random.uniform(self.min_delay, mono_cut.duration)
     
@@ -658,10 +393,10 @@ class TargetSpeakerSimulator():
         query_speaker_id = sampled_speaker_ids[index]
         query_manifest_list = deepcopy(self.spk2manifests[query_speaker_id])
         query_manifest = random.choice(query_manifest_list)
-        query_cut = self.json_to_cut(query_manifest)
+        query_cut = json_to_cut(query_manifest)
         text = self.get_text(mixed_cut, query_speaker_id)
         sup = SupervisionSegment(id = mixed_cut.id, recording_id = mixed_cut.id, start = 0, duration=mixed_cut.duration, text = text)
-        query_offset, query_duration = self.get_bounded_segment(query_cut.start, query_cut.duration, min_duration=self.query_duration[0], max_duration=self.query_duration[1])
+        query_offset, query_duration = get_bounded_segment(query_cut.start, query_cut.duration, min_duration=self.query_duration[0], max_duration=self.query_duration[1])
         custom = {
                 'pnc': 'no',
                 'source_lang': 'en',
@@ -686,32 +421,6 @@ class TargetSpeakerSimulator():
     def ConversationSimulator(self):
         raise NotImplementedError("ConversationSimulator is not implemented yet.")
     
-    def json_to_cut(self, json_dict):
-        """
-        Convert a json dictionary to a Cut instance.
-        """
-        audio_path = json_dict["audio_filepath"]
-        duration = json_dict["duration"]
-        offset = json_dict.get("offset", None)
-        cut = self._create_cut(
-            audio_path=audio_path, offset=offset, duration=duration, sampling_rate=json_dict.get("sampling_rate", None)
-        )
-        # Note that start=0 and not start=offset because supervision's start if relative to the
-        # start of the cut; and cut.start is already set to offset
-        cut.supervisions.append(
-            SupervisionSegment(
-                id=cut.id,
-                recording_id=cut.recording_id,
-                start=0,
-                duration=cut.duration,
-                text=json_dict.get("text"),
-                language=json_dict.get("language", "en"),
-            )
-        )
-        cut.custom = json_dict
-
-        return cut
-
     # TODO: text is necessary for msasr and tsasr, but not for diar
     def get_text(self, cut: MixedCut, query_speaker_id) -> str:
         for i, track in enumerate(cut.tracks):
@@ -719,67 +428,6 @@ class TargetSpeakerSimulator():
                 return track.cut.text
         return ValueError ('Error in finding query speaker in target utterance')
 
-    def get_bounded_segment(self, start_time, total_duration, min_duration=1.0, max_duration=10.0):
-        """
-        Generate a segment within an audio clip with bounded duration.
-        
-        Args:
-            start_time (float): Start time of the audio in seconds
-            total_duration (float): Total duration of the audio in seconds
-            min_duration (float): Minimum allowed segment duration in seconds
-            max_duration (float): Maximum allowed segment duration in seconds
-        
-        Returns:
-            tuple: (segment_start, segment_duration)
-        """
-        import random
-        # Ensure max_duration doesn't exceed total_duration
-        max_duration = min(max_duration, total_duration)
-        
-        # Ensure min_duration is not greater than max_duration
-        min_duration = min(min_duration, max_duration)
-        
-        # Generate random duration within bounds
-        segment_duration = np.round(random.uniform(min_duration, max_duration), decimals=3)
-        
-        # Calculate maximum possible start time
-        max_start = total_duration - segment_duration
-        
-        # Generate random start time
-        segment_start = np.round(random.uniform(start_time, start_time + max_start), decimals=3)
-        
-        return segment_start, segment_duration
 
-    def _create_cut(
-        self,
-        audio_path: str,
-        offset: float,
-        duration: float,
-        sampling_rate: int | None = None,
-    ) -> Cut:
-        
-        recording = self._create_recording(audio_path, duration, sampling_rate)
-        cut = recording.to_cut()
-        if offset is not None:
-            cut = cut.truncate(offset=offset, duration=duration, preserve_id=True)
-            cut.id = f"{cut.id}-{round(offset * 1e2):06d}-{round(duration * 1e2):06d}"
-        return cut
-    
-    def _create_recording(
-        self,
-        audio_path: str,
-        duration: float,
-        sampling_rate: int | None = None,
-    ) -> Recording:
-        if sampling_rate is not None:
-            # TODO(pzelasko): It will only work with single-channel audio in the current shape.
-            return Recording(
-                id=audio_path,
-                sources=[AudioSource(type="file", channels=[0], source=audio_path)],
-                sampling_rate=sampling_rate,
-                num_samples=compute_num_samples(duration, sampling_rate),
-                duration=duration,
-                channel_ids=[0],
-            )
-        else:
-            return Recording.from_file(audio_path)
+
+

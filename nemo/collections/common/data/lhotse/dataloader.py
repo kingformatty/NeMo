@@ -57,7 +57,6 @@ from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers.aggregate_tokenizer import TokenizerWrapper
 from nemo.utils import logging
-from nemo.collections.asr.parts.utils.asr_tgtspeaker_utils import LibriSpeechMixGenerator_tgt, LibriSpeechMixSimulator_tgt
 from nemo.collections.common.data.lhotse.cutset import mux
 
 
@@ -205,12 +204,6 @@ class LhotseDataLoadingConfig:
     force_map_dataset: bool = False
     force_iterable_dataset: bool = False
 
-    # 6. Cut generation for MS-ASR / TS-ASR
-    generators: Any = None 
-
-    # 7. Cut Simulator for MS-ASR / TS-ASR
-    simulators: Any = None
-    including_real_data: bool = False
 
 
 def determine_use_iterable_dataset(use_iterable_dataset: bool, config: DictConfig) -> bool:
@@ -465,90 +458,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, use_iterable_dataset = read_cutset_from_config(config)
     use_iterable_dataset = determine_use_iterable_dataset(use_iterable_dataset, config)
-    if config.generators is not None:
-        #genertor use pre-defined mixed manifest to generator audio. It requires pre-generated rttm/audio_file_path. Only wav need to be mixed here. This is meant to alleviate the storage overhead for millions of mixed audio
-        generated_cuts = CutSet()
-        for generator_name in config.generators.keys():
-            generator_config = config.generators[generator_name]
-            if generator_config.get('manifest_filepath', None):
-                cfg_for_generation = LhotseDataLoadingConfig()
-                cfg_for_generation = OmegaConf.create(cfg_for_generation)
-                cfg_for_generation.manifest_filepath = generator_config.manifest_filepath
-                cuts_for_generation, _, _ = read_cutset_from_config(cfg_for_generation)
-            else:
-                raise ValueError ('Invalid generator manifest filepath')
-            if generator_config.get('lsmix',False):
-                # # librimixgenerator
-                assert hasattr(cuts_for_generation[0], 'delays')
-                if hasattr(cuts[0],'query_audio_filepath'):
-                    #TS-ASR
-                    generator = LibriSpeechMixGenerator_tgt()
-                    generated_cuts += generator.generate(cuts_for_generation)
-                else:           
-                    #MS-ASR (not finished)     
-                    generator = LibriSpeechMixGenerator()
-                    generated_cuts += generator.generate(cuts_for_generation)
-        if config.including_real_data:
-            # cuts = CutSet.from_cuts(cuts + generated_cuts)
-            cuts = mux(cuts, generated_cuts)
-        else:
-            cuts = generated_cuts
-
-    if config.simulators is not None:
-        #simulator simulates manifest from single-speaker manifest. audio / rttm / text are all generated on the fly.
-        simulated_cuts = CutSet()
-        for simulator_name in config.simulators.keys():
-            simulator_config = config.simulators[simulator_name]
-            if simulator_config.get('manifest_filepath', None):
-                cfg_for_simulation = LhotseDataLoadingConfig()
-                cfg_for_simulation = OmegaConf.create(cfg_for_simulation)
-                cfg_for_simulation.manifest_filepath = simulator_config.manifest_filepath
-                cuts_for_simulation, _, _ = read_cutset_from_config(cfg_for_simulation)
-            else:
-                raise ValueError ('Invalid simulator manifest filepath')
-            if simulator_config.get('lsmix',False):
-                if simulator_config.ms_data_type == 'tsasr':
-                    #TS-ASR
-                    if simulator_config.get('save_to', None) and os.path.exists(simulator_config.save_to):
-                        lsmix_cuts = CutSet.from_jsonl(simulator_config.save_to)
-                    else:
-                        simulator = LibriSpeechMixSimulator_tgt(
-                                data_type=simulator_config.ms_data_type,
-                                min_delay=0.5,
-                                max_num_speakers=simulator_config.max_num_speakers,
-                                speaker_count_distribution=simulator_config.speaker_count_distribution,
-                                query_duration=simulator_config.query_duration,
-                                delay_factor=simulator_config.delay_factor,
-                            )
-                        lsmix_cuts = simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, non_existing_query_ratio = simulator_config.get('non_existing_query_ratio', 0), num_jobs=1, seed=global_rank*world_size)
-                        if simulator_config.get('save_to',None):
-                            lsmix_cuts.to_jsonl(simulator_config.save_to)
-                    simulated_cuts += lsmix_cuts
-                    del lsmix_cuts
-                elif simulator_config.ms_data_type == 'msasr':
-                    #MS-ASR
-                    simulator = LibriSpeechMixSimulator(
-                            data_type=simulator_config.ms_data_type,
-                            min_delay=0.5,
-                            max_num_speakers=simulator_config.max_num_speakers,
-                            speaker_token_position=simulator_config.speaker_token_position,
-                            speaker_count_distribution=simulator_config.speaker_count_distribution,
-                            delay_factor=simulator_config.delay_factor,
-                        )
-                    simulated_cuts += simulator.simulate(cuts_for_simulation, num_meetings=simulator_config.num_meetings, num_jobs=1, seed=global_rank*world_size)
-                else:
-                    raise ValueError('Invalid ms_data_type, chosen from msasr / tsasr')
-            logging.info(
-                f"Adding Simulated Cuts, size {len(simulated_cuts)}"
-            )
-        if config.including_real_data:
-            # cuts = CutSet.from_cuts(cuts + simulated_cuts)
-            # only support uniform sampling, self-defined sampling TODO
-            #determines weights out side of read_cutset_from_config function to maintain function consistency
-            cuts = mux(cuts, simulated_cuts)
-        else:
-            cuts = simulated_cuts
-
     # Apply channel selector
     if config.channel_selector is not None:
         logging.info('Using channel selector %s.', config.channel_selector)

@@ -48,11 +48,12 @@ import lightning.pytorch as pl
 import optuna
 import torch
 from omegaconf import OmegaConf
-from omegaconf.omegaconf import open_dict
 from pytorch_lightning import seed_everything
 from typing import Dict, List, Tuple, Union
 from tqdm import tqdm
 import math
+import numpy as np
+import uuid
 
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models_w_query import SortformerEncLabelWQueryModel
@@ -76,6 +77,49 @@ from nemo.core.config import hydra_runner
 
 seed_everything(42)
 torch.backends.cudnn.deterministic = True
+
+def compute_eer(scores, labels):
+    """
+    Compute Equal Error Rate (EER) given scores and labels.
+    
+    Args:
+        scores (np.ndarray): Array of confidence scores
+        labels (np.ndarray): Array of binary labels (0 or 1)
+        
+    Returns:
+        eer (float): Equal Error Rate
+        threshold (float): Threshold at EER point
+    """
+    # Convert lists to numpy arrays
+    scores = np.array(scores)
+    labels = np.array(labels)
+    
+    # Sort scores and corresponding labels
+    indices = np.argsort(scores)
+    labels = labels[indices]
+    scores = scores[indices]
+    
+    # Calculate false positive and false negative rates
+    n_pos = np.sum(labels == 1)
+    n_neg = len(labels) - n_pos
+    
+    # Accumulate false positive and false negative counts
+    fn = np.cumsum(labels)  # False negatives
+    fp = n_neg - (np.arange(len(labels)) - fn)  # False positives
+    
+    # Convert to rates
+    fnr = fn / n_pos  # False negative rate
+    fpr = fp / n_neg  # False positive rate
+    
+    # Find threshold where FNR = FPR
+    abs_diff = np.abs(fnr - fpr)
+    min_diff_idx = np.argmin(abs_diff)
+    
+    # Get EER
+    eer = (fnr[min_diff_idx] + fpr[min_diff_idx]) / 2
+    threshold = scores[min_diff_idx]
+    
+    return eer, threshold
 
 
 @dataclass
@@ -113,10 +157,6 @@ class DiarizationConfig:
     optuna_n_trials: int = 100000
     consider_query_in_eval: bool = True # if False, metrics are computed only over target, i.e. exclude query prediction
     use_groundtruth_query_rttm: bool = False # if False, query-session rttm will be set to all one on first spk (regardless of vad)
-    add_query_noise: bool = False
-    noise_path: str = ''
-    query_noise_mix_prob: float = 0.3
-    query_snr: Tuple[float, float] = (2.5, 12.5)
 
 def audio_rttm_map_w_query_info(manifest, attach_dur=False):
     """
@@ -154,6 +194,10 @@ def audio_rttm_map_w_query_info(manifest, attach_dur=False):
                 'query_speaker_id': dic.get('query_speaker_id',None),
                 'query_rttm_filepath': dic.get('query_rttm_filepath', None)
             }
+            if dic.get('speaker_id', None) is not None:
+                meta['speaker_id'] = dic['speaker_id']
+            else:
+                raise ValueError(f"speaker_id is not found in {dic['audio_filepath']}")
             if attach_dur:
                 uniqname = get_uniq_id_with_dur(meta)
             else:
@@ -161,13 +205,14 @@ def audio_rttm_map_w_query_info(manifest, attach_dur=False):
                     uniqname = dic['uniq_id']
                 else:
                     uniqname = get_uniqname_from_filepath(filepath=meta['audio_filepath'])
-            uniqname += meta['query_speaker_id'] if meta['query_speaker_id'] else ''
+            uniqname += str(uuid.uuid4())
+            # uniqname += meta['audio_filepath'] + meta['query_audio_filepath'] if meta['query_audio_filepath'] else '' 
             if uniqname not in AUDIO_RTTM_MAP:
                 AUDIO_RTTM_MAP[uniqname] = meta
             else:
 
                 raise KeyError(
-                    f"file {meta['audio_filepath']} is already part of AUDIO_RTTM_MAP, it might be duplicated, "
+                    f"file {meta['audio_filepath']} with id {uniqname} is already part of AUDIO_RTTM_MAP, it might be duplicated, "
                     "Note: file basename must be unique"
                 )
 
@@ -355,7 +400,7 @@ def convert_pred_mat_to_segments(
     """
     batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
     cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
-
+    import ipdb; ipdb.set_trace()
     #prediction side remove query prediction
     if consider_query_in_eval:
         pass
@@ -367,6 +412,27 @@ def convert_pred_mat_to_segments(
             query_duration = audio_rttm_values['query_duration']
             query_hidden_len = get_hidden_length_from_sample_length(int((1+query_duration) * 16000), 160, 8)
             batch_preds_list[sample_idx] = batch_preds_list[sample_idx][:,query_hidden_len:,:]
+    #speaker verification evaluation - voxceleb style
+    labels = []
+    scores = []
+    for sample_idx, (uniq_id, audio_rttm_values) in tqdm(
+            enumerate(audio_rttm_map_dict.items()), total=len(audio_rttm_map_dict), desc='Getting speaker-0 score'
+        ):
+        encoded_len = get_hidden_length_from_sample_length(int(audio_rttm_values['duration'] * 16000), 160, 8)
+        query_hidden_len = get_hidden_length_from_sample_length(int((1+audio_rttm_values['query_duration']) * 16000), 160, 8)
+        speaker_0_score = batch_preds_list[sample_idx][:,query_hidden_len:query_hidden_len + encoded_len,0] # sigmoid score
+        #get average score of speaker-0
+        same_spk_prob = torch.mean(speaker_0_score)
+        #append labels
+        if audio_rttm_values['speaker_id'] == audio_rttm_values['query_speaker_id']:
+            labels.append(1)
+        else:
+            labels.append(0)
+        #append score
+        scores.append(same_spk_prob)
+    print(compute_eer(scores, labels))
+    import ipdb; ipdb.set_trace()
+    import os; os._exit(1)
     total_speaker_timestamps = predlist_to_timestamps(
         batch_preds_list=batch_preds_list,
         audio_rttm_map_dict=audio_rttm_map_dict,
@@ -374,6 +440,7 @@ def convert_pred_mat_to_segments(
         unit_10ms_frame_count=unit_10ms_frame_count,
         bypass_postprocessing=bypass_postprocessing,
     )
+    import ipdb; ipdb.set_trace()
     for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
         speaker_timestamps = total_speaker_timestamps[sample_idx]
         if audio_rttm_values.get("uniq_id", None) is not None:
@@ -569,11 +636,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Model setup for inference
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model._cfg.test_ds.use_lhotse = True
-    if cfg.add_query_noise:
-        with open_dict(diar_model._cfg.test_ds):
-            diar_model._cfg.test_ds['query_noise_path'] = cfg.noise_path
-            diar_model._cfg.test_ds['query_noise_mix_prob'] = cfg.query_noise_mix_prob
-            diar_model._cfg.test_ds['query_snr'] = cfg.query_snr
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
@@ -588,7 +650,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     logging.info(f"No saved prediction tensors found. Running inference on the dataset...")
     diar_model.test_batch()
     diar_model_preds_total_list = diar_model.preds_total_list
-    # torch.save(diar_model.preds_total_list, tensor_path)
+        # torch.save(diar_model.preds_total_list, tensor_path)
+
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
         run_optuna_hyperparam_search(
