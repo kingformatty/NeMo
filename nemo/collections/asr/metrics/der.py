@@ -176,9 +176,9 @@ def score_labels(
         for idx, (reference, hypothesis) in enumerate(zip(all_reference, all_hypothesis)):
             ref_key, ref_labels = reference
             _, hyp_labels = hypothesis
-            if len(ref_labels.labels()) == len(hyp_labels.labels()):
+            if len(ref_labels.crop(all_uem[idx]).labels()) == len(hyp_labels.labels()):
                 correct_spk_count += 1
-            if verbose and len(ref_labels.labels()) != len(hyp_labels.labels()):
+            if verbose and len(ref_labels.crop(all_uem[idx]).labels()) != len(hyp_labels.labels()):
                 logging.info(
                     f"Wrong Spk. Count with uniq_id:...{ref_key[-10:]}, "
                     f"Ref: {len(ref_labels.labels())}, Hyp: {len(hyp_labels.labels())}"

@@ -103,6 +103,9 @@ def audio_rttm_map(manifest, attach_dur=False):
                 'num_speakers': dic.get('num_speakers', None),
                 'uem_filepath': dic.get('uem_filepath', None),
                 'ctm_filepath': dic.get('ctm_filepath', None),
+                'query_speaker_id': dic.get('query_speaker_id', None),
+                'query_offset': dic.get('query_offset', None),
+                'query_duration': dic.get('query_duration', None),
             }
             if attach_dur:
                 uniqname = get_uniq_id_with_dur(meta)
@@ -111,12 +114,14 @@ def audio_rttm_map(manifest, attach_dur=False):
                     uniqname = dic['uniq_id']
                 else:
                     uniqname = get_uniqname_from_filepath(filepath=meta['audio_filepath'])
-
+            uniqname += str(meta['offset']) + str(meta['duration'])
+            if 'query_speaker_id' in meta.keys():
+                uniqname += '_'+meta['query_speaker_id']+'_'+str(meta['query_offset'])+'_'+str(meta['query_duration'])
             if uniqname not in AUDIO_RTTM_MAP:
                 AUDIO_RTTM_MAP[uniqname] = meta
             else:
                 raise KeyError(
-                    f"file {meta['audio_filepath']} is already part of AUDIO_RTTM_MAP, it might be duplicated, "
+                    f"file {meta['audio_filepath']} with id {uniqname} is already part of AUDIO_RTTM_MAP, it might be duplicated, "
                     "Note: file basename must be unique"
                 )
 

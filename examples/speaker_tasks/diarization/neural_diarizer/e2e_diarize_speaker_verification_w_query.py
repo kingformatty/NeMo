@@ -121,6 +121,19 @@ def compute_eer(scores, labels):
     
     return eer, threshold
 
+def compute_auc(scores, labels):
+    """
+    Compute Area Under the ROC Curve (AUC) given scores and labels.
+    
+    Args:
+        scores (List[float]): List of prediction scores
+        labels (List[int]): List of ground truth labels (0 or 1)
+        
+    Returns:
+        float: AUC score
+    """
+    from sklearn.metrics import roc_auc_score
+    return roc_auc_score(labels, scores)
 
 @dataclass
 class DiarizationConfig:
@@ -400,7 +413,6 @@ def convert_pred_mat_to_segments(
     """
     batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
     cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
-    import ipdb; ipdb.set_trace()
     #prediction side remove query prediction
     if consider_query_in_eval:
         pass
@@ -430,8 +442,9 @@ def convert_pred_mat_to_segments(
             labels.append(0)
         #append score
         scores.append(same_spk_prob)
-    print(compute_eer(scores, labels))
     import ipdb; ipdb.set_trace()
+    print(compute_eer(scores, labels))
+    print(compute_auc(scores, labels))
     import os; os._exit(1)
     total_speaker_timestamps = predlist_to_timestamps(
         batch_preds_list=batch_preds_list,

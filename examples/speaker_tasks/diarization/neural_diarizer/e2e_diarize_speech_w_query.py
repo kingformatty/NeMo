@@ -57,21 +57,22 @@ import math
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models_w_query import SortformerEncLabelWQueryModel
 from nemo.collections.asr.parts.utils.speaker_utils import (
-    audio_rttm_map,
     get_uniqname_from_filepath,
-    timestamps_to_pyannote_object,
     get_uniq_id_with_dur,
     generate_diarization_output_lines,
     labels_to_pyannote_object,
-    rttm_to_labels,
     get_uem_object,
-    convert_rttm_line
 )
 from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
-    predlist_to_timestamps,
 )
+from nemo.collections.asr.parts.utils.vad_utils_tgt_spk import (
+    rttm_to_labels_query,
+    rttm_to_labels_w_query,
+    predlist_to_timestamps_w_query
+)
+
 from nemo.core.config import hydra_runner
 
 seed_everything(42)
@@ -161,8 +162,11 @@ def audio_rttm_map_w_query_info(manifest, attach_dur=False):
                     uniqname = dic['uniq_id']
                 else:
                     uniqname = get_uniqname_from_filepath(filepath=meta['audio_filepath'])
-            uniqname += meta['query_speaker_id'] if meta['query_speaker_id'] else ''
+            uniqname += str(meta['offset']) + str(meta['duration'])
+            if 'query_speaker_id' in meta.keys():
+                uniqname += '_'+meta['query_speaker_id']+'_'+str(meta['query_offset'])+'_'+str(meta['query_duration'])
             if uniqname not in AUDIO_RTTM_MAP:
+                meta['uniq_id'] = uniqname
                 AUDIO_RTTM_MAP[uniqname] = meta
             else:
 
@@ -367,7 +371,7 @@ def convert_pred_mat_to_segments(
             query_duration = audio_rttm_values['query_duration']
             query_hidden_len = get_hidden_length_from_sample_length(int((1+query_duration) * 16000), 160, 8)
             batch_preds_list[sample_idx] = batch_preds_list[sample_idx][:,query_hidden_len:,:]
-    total_speaker_timestamps = predlist_to_timestamps(
+    total_speaker_timestamps = predlist_to_timestamps_w_query(
         batch_preds_list=batch_preds_list,
         audio_rttm_map_dict=audio_rttm_map_dict,
         cfg_vad_params=cfg_vad_params,
@@ -379,8 +383,12 @@ def convert_pred_mat_to_segments(
         if audio_rttm_values.get("uniq_id", None) is not None:
             uniq_id = audio_rttm_values["uniq_id"]
         else:
+            import ipdb; ipdb.set_trace()
+            assert False, "uniq_id is not found"
             uniq_id = get_uniqname_from_filepath(audio_rttm_values["audio_filepath"])
-            uniq_id += audio_rttm_values['query_speaker_id'] if audio_rttm_values['query_speaker_id'] else ''
+            uniq_id += str(audio_rttm_values['offset']) + str(audio_rttm_values['duration'])
+            if 'query_speaker_id' in audio_rttm_map_dict.keys():
+                uniq_id += '_'+audio_rttm_values['query_speaker_id']+'_'+str(audio_rttm_map_dict['query_offset'])+'_'+str(audio_rttm_values['query_duration'])
         all_hypothesis, all_reference, all_uems = timestamps_to_pyannote_object_w_query(
             speaker_timestamps,
             uniq_id,
@@ -448,9 +456,10 @@ def timestamps_to_pyannote_object_w_query(
             query_speaker_id = audio_rttm_values.get('query_speaker_id',None)
             query_rttm_filepath = audio_rttm_values.get('query_rttm_filepath',None)
 
-            uem_lines = [[offset, dur + offset + separater_duration + query_duration]]
+            # uem_lines = [[offset, dur + offset + separater_duration + query_duration]]
+            uem_lines = [[0, dur + separater_duration + query_duration]]
             query_bias = separater_duration + query_duration
-            org_ref_labels = rttm_to_labels_w_query(rttm_file, query_bias)
+            org_ref_labels = rttm_to_labels_w_query(rttm_file, query_bias, offset, dur)
             ref_labels = org_ref_labels
             if query_duration == 0:
                 # if multi-speaker sample
@@ -467,42 +476,14 @@ def timestamps_to_pyannote_object_w_query(
                     # start, end, speaker
                     ref_labels.insert(0, '{} {} {}'.format(0, query_duration, query_speaker_id))
         else:
-            uem_lines = [[offset, dur + offset]]
-            org_ref_labels = rttm_to_labels(rttm_file)
+            uem_lines = [[0, dur]]
+            org_ref_labels = rttm_to_labels_w_query(rttm_file, 0, offset, dur)
             ref_labels = org_ref_labels
         reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
         uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
         all_uems.append(uem_obj)
         all_reference.append([uniq_id, reference])
     return all_hypothesis, all_reference, all_uems
-
-def rttm_to_labels_query(rttm_filename, query_offset, query_duration, query_speaker_id):
-    """
-    Prepare time stamps label list from rttm file
-    """
-    labels = []
-    with open(rttm_filename, 'r') as f:
-        for line in f.readlines():
-            start, end, speaker = convert_rttm_line(line, round_digits=3)
-            #speaker will always be "speech"
-            if start < query_offset + query_duration:
-                start = str(round(float(start - query_offset), 3))
-                end = str(round(float(min(end, query_offset + query_duration) - query_offset), 3))
-                labels.append('{} {} {}'.format(start, end, query_speaker_id))
-    return labels
-
-def rttm_to_labels_w_query(rttm_filename, query_bias):
-    """
-    Prepare time stamps label list from rttm file
-    """
-    labels = []
-    with open(rttm_filename, 'r') as f:
-        for line in f.readlines():
-            start, end, speaker = convert_rttm_line(line, round_digits=3)
-            start = str(round(float(start) + query_bias, 3))
-            end = str(round(float(end) + query_bias, 3))
-            labels.append('{} {} {}'.format(start, end, speaker))
-    return labels
 
 
 @hydra_runner(config_name="DiarizationConfig", schema=DiarizationConfig)
