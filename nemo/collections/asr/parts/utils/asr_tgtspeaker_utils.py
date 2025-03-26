@@ -279,9 +279,9 @@ def get_query_cut(cut):
         #TODO use create_cut function in asr_multispeaker_utils.py
         if cut.query_audio_filepath.find('voxceleb')!= -1:
             #change recording id to be the same as rttm line's session format
-            elements = cut.query_audio_path.split('/')
+            elements = cut.query_audio_filepath.split('/')
             recording_id = elements[-3]+'-'+elements[-2]+'-'+elements[-1][:-4]
-            query_rec = Recording.from_file(cut.query_audio_path, recording_id = recording_id)
+            query_rec = Recording.from_file(cut.query_audio_filepath, recording_id = recording_id)
         else:
             query_rec = Recording.from_file(cut.query_audio_filepath)
         if query_rec.sampling_rate != 16000:
