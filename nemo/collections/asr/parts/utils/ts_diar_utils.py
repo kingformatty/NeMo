@@ -43,6 +43,9 @@ from nemo.utils import logging
 from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing
 from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line
 
+from nemo.collections.asr.metrics.der import uem_timeline_from_file
+from pyannote.metrics.diarization import DiarizationErrorRate
+
 #some functions re-write for sortformer_w_query (ts_sortformer)
 
 def rttm_to_labels_query(rttm_filename, query_offset, query_duration, query_speaker_id):
@@ -136,3 +139,73 @@ def predlist_to_timestamps_w_query(
         total_speaker_timestamps.append(speaker_timestamps)
     return total_speaker_timestamps
 
+def score_labels_query_speaker_only(
+    AUDIO_RTTM_MAP,
+    all_reference: list,
+    all_hypothesis: list,
+    all_uem: List[List[float]] = None,
+    collar: float = 0.25,
+    ignore_overlap: bool = True,
+    verbose: bool = True,
+) -> Optional[Tuple[DiarizationErrorRate, Dict]]:
+    '''
+    Calculate diarization metrics only for query / target speaker
+    '''
+    metric = None
+    if len(all_reference) == len(all_hypothesis):
+        
+        logging.info("Calculate diarization metrics only for query / target speaker")
+
+        metric = DiarizationErrorRate(collar=2 * collar, skip_overlap=ignore_overlap)
+
+        mapping_dict, correct_spk_count = {}, 0
+        for idx, (uniq_id, audio_rttm_values) in enumerate(AUDIO_RTTM_MAP.items()):
+            reference = all_reference[idx]
+            hypothesis = all_hypothesis[idx]
+            ref_key, ref_labels = reference
+            _, hyp_labels = hypothesis
+
+            # extract query speaker from reference
+            ref_labels = ref_labels.subset([audio_rttm_values['query_speaker_id']])
+            # extract speaker_0 from hypothesis
+            hyp_labels = hyp_labels.subset(['speaker_0'])
+
+            if len(ref_labels.crop(all_uem[idx]).labels()) == len(hyp_labels.labels()):
+                correct_spk_count += 1
+            uem_obj = None
+            if all_uem is not None:
+                metric(ref_labels, hyp_labels, uem=all_uem[idx], detailed=True)
+            elif AUDIO_RTTM_MAP[ref_key].get('uem_filepath', None) is not None:
+                uem_file = AUDIO_RTTM_MAP[ref_key].get('uem_filepath', None)
+                uem_obj = uem_timeline_from_file(uem_file=uem_file, uniq_name=ref_key)
+                metric(ref_labels, hyp_labels, uem=uem_obj, detailed=True)
+            else:
+                metric(ref_labels, hyp_labels, detailed=True)
+            mapping_dict[ref_key] = metric.optimal_mapping(ref_labels, hyp_labels)
+
+        spk_count_acc = correct_spk_count / len(all_reference)
+        DER = abs(metric)
+        if metric['total'] == 0:
+            raise ValueError("Total evaluation time is 0. Abort.")
+        CER = metric['confusion'] / metric['total']
+        FA = metric['false alarm'] / metric['total']
+        MISS = metric['missed detection'] / metric['total']
+
+        itemized_errors = (DER, CER, FA, MISS)
+
+        if verbose:
+            logging.info(f"\n{metric.report()}")
+        logging.info(
+            f"Cumulative Results for collar {collar} sec and ignore_overlap {ignore_overlap}: \n"
+            f"| FA: {FA:.4f} | MISS: {MISS:.4f} | CER: {CER:.4f} | DER: {DER:.4f} | "
+            f"Spk. Count Acc. {spk_count_acc:.4f}\n"
+        )
+
+        return metric, mapping_dict, itemized_errors
+    elif verbose:
+        logging.warning(
+            "Check if each ground truth RTTMs were present in the provided manifest file. "
+            "Skipping calculation of Diariazation Error Rate"
+        )
+    return None
+    

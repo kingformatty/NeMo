@@ -67,10 +67,11 @@ from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
 )
-from nemo.collections.asr.parts.utils.vad_utils_tgt_spk import (
+from nemo.collections.asr.parts.utils.ts_diar_utils import (
     rttm_to_labels_query,
     rttm_to_labels_w_query,
-    predlist_to_timestamps_w_query
+    predlist_to_timestamps_w_query,
+    score_labels_query_speaker_only
 )
 
 from nemo.core.config import hydra_runner
@@ -118,6 +119,7 @@ class DiarizationConfig:
     noise_path: str = ''
     query_noise_mix_prob: float = 0.3
     query_snr: Tuple[float, float] = (2.5, 12.5)
+    eval_query_speaker_only: bool = False
 
 def audio_rttm_map_w_query_info(manifest, attach_dur=False):
     """
@@ -603,6 +605,18 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         )
         logging.info(f"PostProcessingParams: {postprocessing_cfg}")
 
+    ## additional metrics
+    
+    # 1. diarization error rate for query/target speaker, i.e.first row of  the groundtruth and prediction (temporaly blindly trust the model predicts the query speaker as speaker 0)
 
+    if cfg.consider_query_in_eval and cfg.eval_query_speaker_only:
+        score_labels_query_speaker_only(
+            AUDIO_RTTM_MAP=infer_audio_rttm_dict,
+            all_reference=all_refs,
+            all_hypothesis=all_hyps,
+            all_uem=all_uems,
+            collar=cfg.collar,
+            ignore_overlap=cfg.ignore_overlap,
+        )
 if __name__ == '__main__':
     main()

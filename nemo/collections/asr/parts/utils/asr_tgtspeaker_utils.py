@@ -275,7 +275,15 @@ def get_query_cut(cut):
     '''    
     if 'query_audio_filepath' in cut.custom:
         #no query is provided for query cut
-        query_rec = Recording.from_file(cut.query_audio_filepath)
+        #no query is provided for query cut
+        #TODO use create_cut function in asr_multispeaker_utils.py
+        if cut.query_audio_filepath.find('voxceleb')!= -1:
+            #change recording id to be the same as rttm line's session format
+            elements = cut.query_audio_path.split('/')
+            recording_id = elements[-3]+'-'+elements[-2]+'-'+elements[-1][:-4]
+            query_rec = Recording.from_file(cut.query_audio_path, recording_id = recording_id)
+        else:
+            query_rec = Recording.from_file(cut.query_audio_filepath)
         if query_rec.sampling_rate != 16000:
             query_rec = query_rec.resample(sampling_rate=16000)
         query_sups = [SupervisionSegment(id=query_rec.id+'_query'+str(cut.query_offset)+'-'+str(cut.query_offset + cut.query_duration), recording_id = query_rec.id, start = 0, duration = cut.query_duration, speaker = cut.query_speaker_id)]
@@ -394,7 +402,7 @@ class TargetSpeakerSimulator():
         query_manifest_list = deepcopy(self.spk2manifests[query_speaker_id])
         query_manifest = random.choice(query_manifest_list)
         query_cut = json_to_cut(query_manifest)
-        text = self.get_text(mixed_cut, query_speaker_id)
+        text = self.get_text(mixed_cut, query_speaker_id) if hasattr(mixed_cut, 'text') else ""
         sup = SupervisionSegment(id = mixed_cut.id, recording_id = mixed_cut.id, start = 0, duration=mixed_cut.duration, text = text)
         query_offset, query_duration = get_bounded_segment(query_cut.start, query_cut.duration, min_duration=self.query_duration[0], max_duration=self.query_duration[1])
         custom = {

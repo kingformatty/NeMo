@@ -246,6 +246,11 @@ def _create_recording(
             channel_ids=[0],
         )
     else:
+        if audio_path.find('voxceleb')!= -1:
+            #change recording id to be the same as rttm line's session format
+            elements = audio_path.split('/')
+            recording_id = elements[-3]+'-'+elements[-2]+'-'+elements[-1][:-4]
+            return Recording.from_file(audio_path, recording_id = recording_id)
         return Recording.from_file(audio_path)
 
 def get_bounded_segment(start_time, total_duration, min_duration=1.0, max_duration=10.0):
