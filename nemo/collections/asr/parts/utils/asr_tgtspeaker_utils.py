@@ -320,6 +320,8 @@ class TargetSpeakerSimulator():
         num_speakers, 
         simulator_type,
         min_delay=0.5,
+        max_delay_after_each_mono: float = 0,
+        non_query_sample: bool = False,
         query_duration: List[float] = [3, 10]
     ):
         """
@@ -338,13 +340,18 @@ class TargetSpeakerSimulator():
                 The list elements are the weights for each speaker.
             min_delay (float): The minimum delay between speakers
                 to avoid the same starting time for multiple speakers.
+            max_delay_after_each_mono (float): The maximum delay of another mono cut after each mono cut. Default is 0, means audio mixtures guaranteed to overlap. 
+            non_query_sample (bool): Whether to sample a non-query sample. Default is False.
+            query_duration (list): The duration of the query sample. Default is [3, 10].
         """
     
         self.manifests = LazyJsonlIterator(manifest_filepath)
         self.min_delay = min_delay
+        self.max_delay_after_each_mono = max_delay_after_each_mono
         self.num_speakers = num_speakers
         self.simulator_type = simulator_type
         self.query_duration = query_duration
+        self.non_query_sample = non_query_sample
 
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
@@ -396,9 +403,11 @@ class TargetSpeakerSimulator():
             offset += random.uniform(self.min_delay, mono_cut.duration)
     
         mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
-
-        index = random.randrange(len(sampled_speaker_ids))
-        query_speaker_id = sampled_speaker_ids[index]
+        if self.non_query_sample:
+            query_speaker_id = random.sample(set(self.speaker_ids) - set(sampled_speaker_ids), 1)[0]
+        else:
+            index = random.randrange(len(sampled_speaker_ids))
+            query_speaker_id = sampled_speaker_ids[index]
         query_manifest_list = deepcopy(self.spk2manifests[query_speaker_id])
         query_manifest = random.choice(query_manifest_list)
         query_cut = json_to_cut(query_manifest)

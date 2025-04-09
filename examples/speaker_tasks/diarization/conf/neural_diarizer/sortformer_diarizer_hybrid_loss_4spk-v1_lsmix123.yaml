@@ -23,30 +23,35 @@ model:
       - type: group
         weight: 0.5
         input_cfg:
-        - type: multi_speaker_simulator
+        - type: tgt_speaker_simulator
           manifest_filepath: /home/jinhanw/Dataset/local/diarization/LibriSpeechMix/diar_w_query/train_960_w_rttm_w_spk_id.json
           weight: 0.2
           task: ssa # diar, msasr
           simulator_type: lsmix # meeting, conversation
           num_speakers: 1
           min_delay: 0.5
-        - type: multi_speaker_simulator
+          max_delay_after_each_mono: 2
+
+        - type: tgt_speaker_simulator
           manifest_filepath: /home/jinhanw/Dataset/local/diarization/LibriSpeechMix/diar_w_query/train_960_w_rttm_w_spk_id.json
           weight: 0.4
           task: ssa # diar, msasr
           simulator_type: lsmix # meeting, conversation
           num_speakers: 2
           min_delay: 0.5
-        - type: multi_speaker_simulator
+          max_delay_after_each_mono: 2
+
+        - type: tgt_speaker_simulator
           manifest_filepath: /home/jinhanw/Dataset/local/diarization/LibriSpeechMix/diar_w_query/train_960_w_rttm_w_spk_id.json
           weight: 0.4
           task: ssa # diar, msasr
           simulator_type: lsmix # meeting, conversation
           num_speakers: 3
           min_delay: 0.5
-          
+          max_delay_after_each_mono: 2
+
       - type: group
-        weight: 0.5
+        weight: 0.9
         input_cfg:
         - type: tgt_speaker_simulator
           manifest_filepath: /home/jinhanw/Dataset/local/diarization/LibriSpeechMix/diar_w_query/train_960_w_rttm_w_spk_id.json
@@ -55,6 +60,8 @@ model:
           simulator_type: lsmix # meeting, conversation
           num_speakers: 1
           min_delay: 0.5
+          max_delay_after_each_mono: 2
+          non_query_sample: True
 
         - type: tgt_speaker_simulator
           manifest_filepath: /home/jinhanw/Dataset/local/diarization/LibriSpeechMix/diar_w_query/train_960_w_rttm_w_spk_id.json
@@ -63,7 +70,8 @@ model:
           simulator_type: lsmix # meeting, conversation
           num_speakers: 2
           min_delay: 0.5
-
+          max_delay_after_each_mono: 2
+          non_query_sample: True
         - type: tgt_speaker_simulator
           manifest_filepath: /home/jinhanw/Dataset/local/diarization/LibriSpeechMix/diar_w_query/train_960_w_rttm_w_spk_id.json
           weight: 0.4
@@ -71,6 +79,9 @@ model:
           simulator_type: lsmix # meeting, conversation
           num_speakers: 3
           min_delay: 0.5
+          max_delay_after_each_mono: 2
+          non_query_sample: True
+
 
     sample_rate: ${model.sample_rate}
     num_spks: ${model.max_num_of_spks}

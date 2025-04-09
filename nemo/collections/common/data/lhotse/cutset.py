@@ -636,6 +636,8 @@ def read_multi_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
             num_speakers=config.num_speakers,
             simulator_type=config.simulator_type,
             min_delay=config.get("min_delay", 0.5),
+            max_delay_after_each_mono=config.get("max_delay_after_each_mono", 0),
+            non_query_sample=config.get("non_query_sample", False),
         )
     )
 
