@@ -323,7 +323,7 @@ class TargetSpeakerSimulator():
         max_delay_after_each_mono: float = 0,
         non_query_sample: bool = False,
         query_duration: List[float] = [3, 10],
-        mono_duration: List[float] = [0, 20]
+        mono_duration: List[float] = [0.5, 20]
     ):
         """
         Args:
@@ -344,7 +344,7 @@ class TargetSpeakerSimulator():
             max_delay_after_each_mono (float): The maximum delay of another mono cut after each mono cut. Default is 0, means audio mixtures guaranteed to overlap. 
             non_query_sample (bool): Whether to sample a non-query sample. Default is False.
             query_duration (list): The duration of the query sample. Default is [3, 10].
-            max_duration (float): The maximum duration of the simulated audio. Default is 90.
+            mono_duration (list): The duration [min, max]of the mono cut. Default is [0.5, 20]. need to set min_duration > 0 if max_after_each_mono > 0!!!
         """
     
         self.manifests = LazyJsonlIterator(manifest_filepath)
