@@ -115,7 +115,7 @@ def audio_rttm_map(manifest, attach_dur=False):
                 else:
                     uniqname = get_uniqname_from_filepath(filepath=meta['audio_filepath'])
             uniqname += str(meta['offset']) + str(meta['duration'])
-            if 'query_speaker_id' in meta.keys():
+            if 'query_speaker_id' in meta.keys() and meta['query_speaker_id'] is not None:
                 uniqname += '_'+meta['query_speaker_id']+'_'+str(meta['query_offset'])+'_'+str(meta['query_duration'])
             if uniqname not in AUDIO_RTTM_MAP:
                 AUDIO_RTTM_MAP[uniqname] = meta

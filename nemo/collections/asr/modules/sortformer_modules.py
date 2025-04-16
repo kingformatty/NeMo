@@ -42,6 +42,15 @@ class SortformerModules(NeuralModule, Exportable):
         dropout_rate: float = 0.5,
         fc_d_model: int = 512,
         tf_d_model: int = 192,
+        subsampling_factor: int = 8,
+        mem_len: int = 188,
+        fifo_len: int = 0,  
+        step_len: int = 376,
+        mem_refresh_rate: int = 1,
+        use_memory_pe: bool = False,
+        step_left_context: int = 0,
+        step_right_context: int = 0,
+        mem_sil_frames_per_spk: int = 5,
     ):
         """
         Args:

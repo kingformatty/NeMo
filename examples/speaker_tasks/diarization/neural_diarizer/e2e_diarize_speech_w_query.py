@@ -558,7 +558,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             diar_model._cfg.test_ds['query_noise_mix_prob'] = cfg.query_noise_mix_prob
             diar_model._cfg.test_ds['query_snr'] = cfg.query_snr
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
-
+    if 'streaming_mode' in diar_model._cfg:
+        diar_model._cfg.streaming_mode = cfg.get('streaming_mode', False)
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path = get_tensor_path(cfg)
 

@@ -322,7 +322,8 @@ class TargetSpeakerSimulator():
         min_delay=0.5,
         max_delay_after_each_mono: float = 0,
         non_query_sample: bool = False,
-        query_duration: List[float] = [3, 10]
+        query_duration: List[float] = [3, 10],
+        mono_duration: List[float] = [0, 20]
     ):
         """
         Args:
@@ -343,6 +344,7 @@ class TargetSpeakerSimulator():
             max_delay_after_each_mono (float): The maximum delay of another mono cut after each mono cut. Default is 0, means audio mixtures guaranteed to overlap. 
             non_query_sample (bool): Whether to sample a non-query sample. Default is False.
             query_duration (list): The duration of the query sample. Default is [3, 10].
+            max_duration (float): The maximum duration of the simulated audio. Default is 90.
         """
     
         self.manifests = LazyJsonlIterator(manifest_filepath)
@@ -352,6 +354,7 @@ class TargetSpeakerSimulator():
         self.simulator_type = simulator_type
         self.query_duration = query_duration
         self.non_query_sample = non_query_sample
+        self.mono_duration = mono_duration
 
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
@@ -395,12 +398,12 @@ class TargetSpeakerSimulator():
                 }
             mono_cut.custom.update(custom)
             #select random start time and duration for each speaker according to min and max duration
-            start_time, duration = get_bounded_segment(mono_cut.start, mono_cut.duration, min_duration = 0, max_duration = 20)
+            start_time, duration = get_bounded_segment(mono_cut.start, mono_cut.duration, min_duration = self.mono_duration[0], max_duration = self.mono_duration[1])
             mono_cut.start = start_time
             mono_cut.duration = duration
             #TODO extract mono cut text according to start and duration
             tracks.append(MixTrack(cut=deepcopy(mono_cut), type=type(mono_cut), offset=offset))
-            offset += random.uniform(self.min_delay, mono_cut.duration)
+            offset += random.uniform(self.min_delay, mono_cut.duration+self.max_delay_after_each_mono)
     
         mixed_cut = MixedCut(id='lsmix_' + '_'.join([track.cut.id for track in tracks]) + '_' + str(uuid4()), tracks=tracks)
         if self.non_query_sample:
@@ -428,7 +431,6 @@ class TargetSpeakerSimulator():
                     }
         mixed_cut.tracks[0].cut.supervisions = [sup]
         mixed_cut.tracks[0].cut.custom.update(custom)
-        
         
         return mixed_cut
 
