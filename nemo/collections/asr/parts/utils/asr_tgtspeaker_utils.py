@@ -143,7 +143,11 @@ def speaker_to_target_w_query(
         mask = np.zeros((num_speakers, encoder_hidden_len))
         if hasattr(query, 'rttm_filepath') and query.rttm_filepath is not None:
             query_rttms = SupervisionSet.from_rttm(query.rttm_filepath)
-            query_segments_iterator = find_segments_from_rttm(recording_id=query.recording_id, rttms=query_rttms, start_after=query.start, end_before=query.end, tolerance=0.0)
+            if query.rttm_filepath.find('ami') == -1:
+                query_segments_iterator = find_segments_from_rttm(recording_id=query.recording_id, rttms=query_rttms, start_after=query.start, end_before=query.end, tolerance=0.0)
+            else:
+                #AMI needs to bound the segments to the query segments iterator
+                query_segments_iterator = query_rttms.find(recording_id=query.recording_id, start_after=query.start, end_before=query.end, adjust_offset=True)
             query_segments_total = []
             for seg in query_segments_iterator:
                 #truncate negative start
@@ -388,7 +392,8 @@ class TargetSpeakerSimulator():
             mono_cuts.append(json_to_cut(manifest))
 
         tracks = []
-        offset = 0.0
+        initial_offset = 2
+        offset = random.uniform(0.0, initial_offset)
         for mono_cut in mono_cuts:
             custom = {
                     'pnc': 'no',
