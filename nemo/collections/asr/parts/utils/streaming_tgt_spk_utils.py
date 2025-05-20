@@ -150,7 +150,7 @@ class FrameBatchDiarizer_tgt_spk:
             raise ValueError('Frame exceed audio')
         return samples
 
-    def read_audio_file(self, audio_filepath: str, offset, duration, query_audio_file, query_offset, query_duration, separater_freq, separater_duration, separater_unvoice_ratio,delay, model_stride_in_secs):
+    def read_audio_file(self, audio_filepath: str, offset, duration, query_audio_file, query_offset, query_duration, separater_freq, separater_duration, separater_unvoice_ratio,delay, model_stride_in_secs, tokens_per_chunk):
         # samples = get_samples(audio_filepath)
         # rewrite loading audio function to support partial audio
         samples = self.get_partial_samples(audio_filepath, offset, duration)
@@ -173,7 +173,8 @@ class FrameBatchDiarizer_tgt_spk:
         self.all_diar_preds = None
         self.selected_regions = set()
         self.change_query_action = []
-
+        self.delay = delay
+        self.tokens_per_chunk = tokens_per_chunk
     def set_frame_reader(self, frame_reader):
         self.frame_bufferer.set_frame_reader(frame_reader)
 
@@ -222,15 +223,13 @@ class FrameBatchDiarizer_tgt_spk:
             # log_probs = log_probs[:,self.query_pred_len-1:-hidden_padding_len+1,:]
             # predictions = predictions[:,self.query_pred_len-1:-hidden_padding_len+1]
 
-            #dynamic query
+
             self.asr_model.diar_preds = preds
 
+            # update tailing diar preds with new diar preds
             if self.all_diar_preds is None:
-
                 self.all_diar_preds = self.asr_model.diar_preds[:,self.query_pred_len-1:]
-
                 self.all_audio = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
-
                 self.query_pred = self.asr_model.diar_preds[:,:self.query_pred_len]
             else:
                 import numpy as np
@@ -239,6 +238,19 @@ class FrameBatchDiarizer_tgt_spk:
                 self.all_audio = F.pad(self.all_audio, (0, self.frame_bufferer.feature_frame_len, 0, 0))
                 self.all_audio[:, -self.frame_bufferer.feature_buffer_len:] = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
 
+            # # concatenate mid-buffer diar preds (similar to token aggregation)
+            # if self.all_diar_preds is None:
+            #     #initialize all_diar_preds and all_audio
+            #     self.all_diar_preds = self.asr_model.diar_preds[:, self.asr_model.diar_preds.shape[1] - 1 - self.delay : self.asr_model.diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]
+            #     self.all_audio = feat_signal[:, int((self.asr_model.diar_preds.shape[1] - 1 - self.delay) / 12.5 * 16000): int((self.asr_model.diar_preds.shape[1] - 1 - self.delay+ self.tokens_per_chunk) / 12.5 * 16000)]
+            #     self.query_pred = self.asr_model.diar_preds[:,:self.query_pred_len]
+            # else:
+            #     #concatenate new diar_preds and audio
+            #     self.all_diar_preds = torch.cat([self.all_diar_preds, self.asr_model.diar_preds[:, self.asr_model.diar_preds.shape[1] - 1 - self.delay : self.asr_model.diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]], dim=1)
+            #     self.all_audio = torch.cat([self.all_audio, feat_signal[:, int((self.asr_model.diar_preds.shape[1] - 1 - self.delay) / 12.5 * 16000): int((self.asr_model.diar_preds.shape[1] - 1 - self.delay+ self.tokens_per_chunk) / 12.5 * 16000)]], dim=1)
+
+
+            #dynamic query
             if self.dynamic_query:
                 self.query_refresh_count += 1
                 #select new query from history

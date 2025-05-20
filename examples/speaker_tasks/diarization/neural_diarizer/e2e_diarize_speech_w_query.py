@@ -350,7 +350,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             use_groundtruth_query_rttm=cfg.use_groundtruth_query_rttm,
         )
         logging.info(f"Evaluating the model on the {len(diar_model_preds_total_list)} audio segments...")
-        score_labels(
+        metrics, mapping_dict, itemized_errors = score_labels(
             AUDIO_RTTM_MAP=infer_audio_rttm_dict,
             all_reference=all_refs,
             all_hypothesis=all_hyps,
@@ -359,13 +359,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             ignore_overlap=cfg.ignore_overlap,
         )
         logging.info(f"PostProcessingParams: {postprocessing_cfg}")
-
+        #save metrics report to csv at the same directory as the rttm_folder
+        report_path = os.path.join('/'.join(cfg.out_rttm_dir.split('/')[:-1]), 'metrics_report.csv')
+        report = metrics.report(display = False)
+        report.to_csv(report_path)
     ## additional metrics
     
     # 1. diarization error rate for query/target speaker, i.e.first row of  the groundtruth and prediction (temporaly blindly trust the model predicts the query speaker as speaker 0)
 
     if cfg.consider_query_in_eval and cfg.eval_query_speaker_only:
-        score_labels_query_speaker_only(
+        metrics, mapping_dict, itemized_errors = score_labels_query_speaker_only(
             AUDIO_RTTM_MAP=infer_audio_rttm_dict,
             all_reference=all_refs,
             all_hypothesis=all_hyps,
@@ -373,5 +376,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             collar=cfg.collar,
             ignore_overlap=cfg.ignore_overlap,
         )
+        #save metrics report to csv at the same directory as the rttm_folder
+        report_path = os.path.join('/'.join(cfg.out_rttm_dir.split('/')[:-1]), 'metrics_report_tsder.csv')
+        report = metrics.report(display = False)
+        report.to_csv(report_path)
 if __name__ == '__main__':
     main()

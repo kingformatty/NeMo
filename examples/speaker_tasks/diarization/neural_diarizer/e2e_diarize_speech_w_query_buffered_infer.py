@@ -65,6 +65,7 @@ from nemo.collections.asr.parts.utils.ts_diar_utils import (
     score_labels_query_speaker_only,
     audio_rttm_map_w_query_info,
     convert_pred_mat_to_segments,
+    get_hidden_length_from_sample_length,
 )
 
 from nemo.core.config import hydra_runner
@@ -340,6 +341,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     chunk_len = float(cfg.chunk_len_in_secs)
     total_buffer = cfg.total_buffer_in_secs
     mid_delay = math.ceil((chunk_len + (total_buffer - chunk_len) / 2) / model_stride_in_secs)
+    tokens_per_chunk = math.ceil(chunk_len / model_stride_in_secs)
 
     logging.info(f"Chunk length in secs: {chunk_len}, Total buffer in secs: {total_buffer}")
     
@@ -378,12 +380,17 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
                 separater_unvoice_ratio,
                 mid_delay,
                 model_stride_in_secs,
+                tokens_per_chunk,
             )
 
             frame_diarizer.infer_logits()
 
             #remove leading silcence from all_diar_preds and prepend with query_pred
-            leading_silence_len = int((frame_diarizer.frame_bufferer.feature_buffer_len - frame_diarizer.frame_bufferer.feature_frame_len) / 16000 * 12.5)
+            #override tailing diar preds config
+            leading_silence_len = get_hidden_length_from_sample_length((frame_diarizer.frame_bufferer.feature_buffer_len - frame_diarizer.frame_bufferer.feature_frame_len), 160, 8)
+            #aggreate mid-buffer diar preds
+            # leading_silence_len = get_hidden_length_from_sample_length((frame_diarizer.frame_bufferer.feature_buffer_len - frame_diarizer.frame_bufferer.feature_frame_len) / 2, 160, 8)
+            
             diar_preds = frame_diarizer.all_diar_preds[:,leading_silence_len:]
             diar_preds = torch.cat([frame_diarizer.query_pred, diar_preds], dim=1)
             diar_model_preds_total_list.append(diar_preds)
@@ -424,7 +431,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             use_groundtruth_query_rttm=cfg.use_groundtruth_query_rttm,
         )
         logging.info(f"Evaluating the model on the {len(diar_model_preds_total_list)} audio segments...")
-        score_labels(
+        metrics, mapping_dict, itemized_errors = score_labels(
             AUDIO_RTTM_MAP=infer_audio_rttm_dict,
             all_reference=all_refs,
             all_hypothesis=all_hyps,
@@ -433,13 +440,16 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             ignore_overlap=cfg.ignore_overlap,
         )
         logging.info(f"PostProcessingParams: {postprocessing_cfg}")
-
+        #save metrics report to csv at the same directory as the rttm_folder
+        report_path = os.path.join('/'.join(cfg.out_rttm_dir.split('/')[:-1]), 'metrics_report.csv')
+        report = metrics.report(display = False)
+        report.to_csv(report_path)
     ## additional metrics
     
     # 1. diarization error rate for query/target speaker, i.e.first row of  the groundtruth and prediction (temporaly blindly trust the model predicts the query speaker as speaker 0)
 
     if cfg.consider_query_in_eval and cfg.eval_query_speaker_only:
-        score_labels_query_speaker_only(
+        metrics, mapping_dict, itemized_errors = score_labels_query_speaker_only(
             AUDIO_RTTM_MAP=infer_audio_rttm_dict,
             all_reference=all_refs,
             all_hypothesis=all_hyps,
@@ -447,5 +457,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             collar=cfg.collar,
             ignore_overlap=cfg.ignore_overlap,
         )
+        #save metrics report to csv at the same directory as the rttm_folder
+        report_path = os.path.join('/'.join(cfg.out_rttm_dir.split('/')[:-1]), 'metrics_report_tsder.csv')
+        report = metrics.report(display = False)
+        report.to_csv(report_path)
 if __name__ == '__main__':
     main()
