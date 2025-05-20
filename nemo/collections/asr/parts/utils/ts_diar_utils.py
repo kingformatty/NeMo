@@ -32,7 +32,7 @@ import pandas as pd
 import torch
 import yaml
 from omegaconf import DictConfig, OmegaConf
-from pyannote.core import Annotation, Segment
+from pyannote.core import Annotation, Segment, Timeline
 from pyannote.metrics import detection
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import ParameterGrid
@@ -45,6 +45,13 @@ from nemo.collections.asr.parts.utils.speaker_utils import convert_rttm_line
 
 from nemo.collections.asr.metrics.der import uem_timeline_from_file
 from pyannote.metrics.diarization import DiarizationErrorRate
+from nemo.collections.asr.parts.utils.speaker_utils import (
+    get_uniqname_from_filepath,
+    get_uniq_id_with_dur,
+    generate_diarization_output_lines,
+    labels_to_pyannote_object,
+    get_uem_object,
+)
 
 #some functions re-write for sortformer_w_query (ts_sortformer)
 
@@ -208,4 +215,245 @@ def score_labels_query_speaker_only(
             "Skipping calculation of Diariazation Error Rate"
         )
     return None
+
+def audio_rttm_map_w_query_info(manifest, attach_dur=False):
+    """
+    This function creates AUDIO_RTTM_MAP which is used by all diarization components to extract embeddings,
+    cluster and unify time stamps
+
+    Args:
+        manifest (str): Path to the manifest file
+        attach_dur (bool, optional): If True, attach duration information to the unique name. Defaults to False.
+
+    Returns:
+        AUDIO_RTTM_MAP (dict) : Dictionary with unique names as keys and corresponding metadata as values.
+    """
+
+    AUDIO_RTTM_MAP = {}
+    with open(manifest, 'r') as inp_file:
+        lines = inp_file.readlines()
+        logging.info("Number of files to diarize: {}".format(len(lines)))
+        for line in lines:
+            line = line.strip()
+            dic = json.loads(line)
+
+            meta = {
+                'audio_filepath': dic['audio_filepath'],
+                'rttm_filepath': dic.get('rttm_filepath', None),
+                'offset': dic.get('offset', None),
+                'duration': dic.get('duration', None),
+                'text': dic.get('text', None),
+                'num_speakers': dic.get('num_speakers', None),
+                'uem_filepath': dic.get('uem_filepath', None),
+                'ctm_filepath': dic.get('ctm_filepath', None),
+                'query_audio_filepath': dic.get('query_audio_filepath',None),
+                'query_offset': dic.get('query_offset',0),
+                'query_duration': dic.get('query_duration',0),
+                'query_speaker_id': dic.get('query_speaker_id',None),
+                'query_rttm_filepath': dic.get('query_rttm_filepath', None)
+            }
+            if attach_dur:
+                uniqname = get_uniq_id_with_dur(meta)
+            else:
+                if "uniq_id" in dic.keys():
+                    uniqname = dic['uniq_id']
+                else:
+                    uniqname = get_uniqname_from_filepath(filepath=meta['audio_filepath'])
+            uniqname += str(meta['offset']) + str(meta['duration'])
+            if 'query_speaker_id' in meta.keys():
+                uniqname += '_'+meta['query_speaker_id']+'_'+str(meta['query_offset'])+'_'+str(meta['query_duration'])
+            if uniqname not in AUDIO_RTTM_MAP:
+                meta['uniq_id'] = uniqname
+                AUDIO_RTTM_MAP[uniqname] = meta
+            else:
+
+                raise KeyError(
+                    f"file {meta['audio_filepath']} is already part of AUDIO_RTTM_MAP, it might be duplicated, "
+                    "Note: file basename must be unique"
+                )
+
+    return AUDIO_RTTM_MAP
+
+def get_hidden_length_from_sample_length(
+    num_samples: int, 
+    num_sample_per_mel_frame: int = 160, 
+    num_mel_frame_per_asr_frame: int = 8
+) -> int:
+    """ 
+    Calculate the hidden length from the given number of samples.
+    This function is needed for speaker diarization with ASR model trainings.
+
+    This function computes the number of frames required for a given number of audio samples,
+    considering the number of samples per mel frame and the number of mel frames per ASR frame.
+
+    Parameters:
+        num_samples (int): The total number of audio samples.
+        num_sample_per_mel_frame (int, optional): The number of samples per mel frame. Default is 160.
+        num_mel_frame_per_asr_frame (int, optional): The number of mel frames per ASR frame. Default is 8.
+
+    Returns:
+        hidden_length (int): The calculated hidden length in terms of the number of frames.
+    """
+    mel_frame_count = math.ceil((num_samples + 1) / num_sample_per_mel_frame)
+    hidden_length = math.ceil(mel_frame_count / num_mel_frame_per_asr_frame)
+    return int(hidden_length)
+
+
+
+def timestamps_to_pyannote_object_w_query(
+    speaker_timestamps: List[Tuple[float, float]],
+    uniq_id: str,
+    audio_rttm_values: Dict[str, str],
+    all_hypothesis: List[Tuple[str, Timeline]],
+    all_reference: List[Tuple[str, Timeline]],
+    all_uems: List[Tuple[str, Timeline]],
+    out_rttm_dir: str | None,
+    consider_query_in_eval: bool = True,
+    use_groundtruth_query_rttm: bool = True,
+):
+    """
+    Convert speaker timestamps to pyannote.core.Timeline object.
+
+    Args:
+        speaker_timestamps (List[Tuple[float, float]]):
+            Timestamps of each speaker: start time and end time of each speaker.
+        uniq_id (str):
+            Unique ID of each speaker.
+        audio_rttm_values (Dict[str, str]):
+            Dictionary of manifest values.
+        all_hypothesis (List[Tuple[str, pyannote.core.Timeline]]):
+            List of hypothesis in pyannote.core.Timeline object.
+        all_reference (List[Tuple[str, pyannote.core.Timeline]]):
+            List of reference in pyannote.core.Timeline object.
+        all_uems (List[Tuple[str, pyannote.core.Timeline]]):
+            List of uems in pyannote.core.Timeline object.
+        out_rttm_dir (str | None):
+            Directory to save RTTMs
+
+    Returns:
+        all_hypothesis (List[Tuple[str, pyannote.core.Timeline]]):
+            List of hypothesis in pyannote.core.Timeline object with an added Timeline object.
+        all_reference (List[Tuple[str, pyannote.core.Timeline]]):
+            List of reference in pyannote.core.Timeline object with an added Timeline object.
+        all_uems (List[Tuple[str, pyannote.core.Timeline]]):
+            List of uems in pyannote.core.Timeline object with an added Timeline object.
+    """
+    offset, dur = float(audio_rttm_values.get('offset', None)), float(audio_rttm_values.get('duration', None))
+    hyp_labels = generate_diarization_output_lines(
+        speaker_timestamps=speaker_timestamps, model_spk_num=len(speaker_timestamps)
+    )
+    hypothesis = labels_to_pyannote_object(hyp_labels, uniq_name=uniq_id)
+    if out_rttm_dir is not None and os.path.exists(out_rttm_dir):
+        with open(f'{out_rttm_dir}/{uniq_id}.rttm', 'w') as f:
+            hypothesis.write_rttm(f)
+    all_hypothesis.append([uniq_id, hypothesis])
+    rttm_file = audio_rttm_values.get('rttm_filepath', None)
+    if rttm_file is not None and os.path.exists(rttm_file):
+        #reference side add query information
+        if consider_query_in_eval:
+            #query related
+            separater_duration = 1
+            query_offset = audio_rttm_values.get('query_offset',0)
+            query_duration = audio_rttm_values.get('query_duration',0)
+            query_speaker_id = audio_rttm_values.get('query_speaker_id',None)
+            query_rttm_filepath = audio_rttm_values.get('query_rttm_filepath',None)
+
+            # uem_lines = [[offset, dur + offset + separater_duration + query_duration]]
+            uem_lines = [[0, dur + separater_duration + query_duration]]
+            query_bias = separater_duration + query_duration
+            org_ref_labels = rttm_to_labels_w_query(rttm_file, query_bias, offset, dur)
+            ref_labels = org_ref_labels
+            if query_duration == 0:
+                # if multi-speaker sample
+                pass
+            else:
+                if use_groundtruth_query_rttm:
+                    if not query_rttm_filepath:
+                        raise ValueError('No query_rttm_filepath, set use_groundtruth_query_rttm to be False')
+                    query_ref_labels = rttm_to_labels_query(query_rttm_filepath, query_offset, query_duration, query_speaker_id)
+                    #extend ref_labels after query_ref_labels
+                    query_ref_labels.extend(ref_labels)
+                    ref_labels = query_ref_labels
+                else:
+                    # start, end, speaker
+                    ref_labels.insert(0, '{} {} {}'.format(0, query_duration, query_speaker_id))
+        else:
+            uem_lines = [[0, dur]]
+            org_ref_labels = rttm_to_labels_w_query(rttm_file, 0, offset, dur)
+            ref_labels = org_ref_labels
+        reference = labels_to_pyannote_object(ref_labels, uniq_name=uniq_id)
+        uem_obj = get_uem_object(uem_lines, uniq_id=uniq_id)
+        all_uems.append(uem_obj)
+        all_reference.append([uniq_id, reference])
+    return all_hypothesis, all_reference, all_uems
+
+def convert_pred_mat_to_segments(
+    audio_rttm_map_dict: Dict[str, Dict[str, str]],
+    postprocessing_cfg,
+    batch_preds_list: List[torch.Tensor],
+    unit_10ms_frame_count: int = 8,
+    bypass_postprocessing: bool = False,
+    out_rttm_dir: str | None = None,
+    consider_query_in_eval: bool = True,
+    use_groundtruth_query_rttm: bool = True,
+):
+    """
+    Convert prediction matrix to time-stamp segments.
+
+    Args:
+        audio_rttm_map_dict (dict): dictionary of audio file path, offset, duration and RTTM filepath.
+        batch_preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
+            Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
+        unit_10ms_frame_count (int, optional): number of 10ms segments in a frame. Defaults to 8.
+        bypass_postprocessing (bool, optional): if True, postprocessing will be bypassed. Defaults to False.
+
+    Returns:
+       all_hypothesis (list): list of pyannote objects for each audio file.
+       all_reference (list): list of pyannote objects for each audio file.
+       all_uems (list): list of pyannote objects for each audio file.
+    """
+    batch_pred_ts_segs, all_hypothesis, all_reference, all_uems = [], [], [], []
+    cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
+
+    #prediction side remove query prediction
+    if consider_query_in_eval:
+        pass
+    else:
+        #remove prediction from query part
+        for sample_idx, (uniq_id, audio_rttm_values) in tqdm(
+            enumerate(audio_rttm_map_dict.items()), total=len(audio_rttm_map_dict), desc='Removing query preds'
+        ):
+            query_duration = audio_rttm_values['query_duration']
+            query_hidden_len = get_hidden_length_from_sample_length(int((1+query_duration) * 16000), 160, 8)
+            batch_preds_list[sample_idx] = batch_preds_list[sample_idx][:,query_hidden_len:,:]
+    total_speaker_timestamps = predlist_to_timestamps_w_query(
+        batch_preds_list=batch_preds_list,
+        audio_rttm_map_dict=audio_rttm_map_dict,
+        cfg_vad_params=cfg_vad_params,
+        unit_10ms_frame_count=unit_10ms_frame_count,
+        bypass_postprocessing=bypass_postprocessing,
+    )
+    for sample_idx, (uniq_id, audio_rttm_values) in enumerate(audio_rttm_map_dict.items()):
+        speaker_timestamps = total_speaker_timestamps[sample_idx]
+        if audio_rttm_values.get("uniq_id", None) is not None:
+            uniq_id = audio_rttm_values["uniq_id"]
+        else:
+            import ipdb; ipdb.set_trace()
+            assert False, "uniq_id is not found"
+            uniq_id = get_uniqname_from_filepath(audio_rttm_values["audio_filepath"])
+            uniq_id += str(audio_rttm_values['offset']) + str(audio_rttm_values['duration'])
+            if 'query_speaker_id' in audio_rttm_map_dict.keys():
+                uniq_id += '_'+audio_rttm_values['query_speaker_id']+'_'+str(audio_rttm_map_dict['query_offset'])+'_'+str(audio_rttm_values['query_duration'])
+        all_hypothesis, all_reference, all_uems = timestamps_to_pyannote_object_w_query(
+            speaker_timestamps,
+            uniq_id,
+            audio_rttm_values,
+            all_hypothesis,
+            all_reference,
+            all_uems,
+            out_rttm_dir,
+            consider_query_in_eval,
+            use_groundtruth_query_rttm,
+        )
+    return all_hypothesis, all_reference, all_uems
     

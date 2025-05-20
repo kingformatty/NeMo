@@ -56,6 +56,7 @@ import math
 
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models_w_query import SortformerEncLabelWQueryModel
+
 from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
@@ -67,7 +68,7 @@ from nemo.collections.asr.parts.utils.ts_diar_utils import (
 )
 
 from nemo.core.config import hydra_runner
-
+from nemo.collections.asr.parts.utils.streaming_tgt_spk_utils import FrameBatchDiarizer_tgt_spk
 seed_everything(42)
 torch.backends.cudnn.deterministic = True
 
@@ -112,6 +113,9 @@ class DiarizationConfig:
     query_noise_mix_prob: float = 0.3
     query_snr: Tuple[float, float] = (2.5, 12.5)
     eval_query_speaker_only: bool = False
+    chunk_len_in_secs: float = 1.0
+    total_buffer_in_secs: float = 4.0
+
 
 
 def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial: optuna.Trial) -> PostProcessingParams:
@@ -210,6 +214,7 @@ def diarization_objective(
     return der
 
 
+
 def run_optuna_hyperparam_search(
     cfg: DiarizationConfig,  # type: DiarizationConfig
     postprocessing_cfg: PostProcessingParams,
@@ -263,8 +268,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.model_path is None:
         raise ValueError("cfg.model_path cannot be None. Please specify the path to the model.")
 
+    #consider_query_in_eval
+    #use groundtruth query rttm
+
     logging.info(f'Consider query in eval: {cfg.consider_query_in_eval}')
-    logging.info(f'Use groundtruth query rttm: {cfg.use_groundtruth_query_rttm}')
 
     # setup GPU
     torch.set_float32_matmul_precision(cfg.matmul_precision)
@@ -322,8 +329,75 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     #     diar_model_preds_total_list = torch.load(tensor_path)
     # else:
     logging.info(f"No saved prediction tensors found. Running inference on the dataset...")
-    diar_model.test_batch()
-    diar_model_preds_total_list = diar_model.preds_total_list
+    #offline inference
+    # diar_model.test_batch()
+    
+    #online inference
+    
+    #configuration setup
+    feature_stride = diar_model._cfg.preprocessor['window_stride']
+    model_stride_in_secs = feature_stride * 8 # model_stride
+    chunk_len = float(cfg.chunk_len_in_secs)
+    total_buffer = cfg.total_buffer_in_secs
+    mid_delay = math.ceil((chunk_len + (total_buffer - chunk_len) / 2) / model_stride_in_secs)
+
+    logging.info(f"Chunk length in secs: {chunk_len}, Total buffer in secs: {total_buffer}")
+    
+    #declare framebatcher
+    frame_diarizer = FrameBatchDiarizer_tgt_spk(
+        diar_model = diar_model,
+        frame_len = chunk_len,
+        total_buffer = total_buffer,
+        batch_size = cfg.batch_size,
+    )
+    diar_model_preds_total_list = []
+
+    with open(cfg.dataset_manifest, 'r', encoding='utf-8') as f:
+        for l in tqdm(f, desc = 'Sample:'):
+            frame_diarizer.reset()
+            row = json.loads(l.strip())
+            audio_file = row['audio_filepath']
+            offset = row['offset']
+            duration = row['duration']
+            query_audio_file = row['query_audio_filepath']
+            query_offset = row['query_offset']
+            query_duration = row['query_duration']
+            separater_freq = diar_model._cfg.test_ds.get('separater_freq', 500)
+            separater_duration = diar_model._cfg.test_ds.get('separater_duration', 1)
+            separater_unvoice_ratio = diar_model._cfg.test_ds.get('separater_unvoice_ratio', 0.3)
+            
+            frame_diarizer.read_audio_file(
+                audio_file,
+                offset,
+                duration,
+                query_audio_file,
+                query_offset,
+                query_duration, 
+                separater_freq,
+                separater_duration,
+                separater_unvoice_ratio,
+                mid_delay,
+                model_stride_in_secs,
+            )
+
+            frame_diarizer.infer_logits()
+
+            #remove leading silcence from all_diar_preds and prepend with query_pred
+            leading_silence_len = int((frame_diarizer.frame_bufferer.feature_buffer_len - frame_diarizer.frame_bufferer.feature_frame_len) / 16000 * 12.5)
+            diar_preds = frame_diarizer.all_diar_preds[:,leading_silence_len:]
+            diar_preds = torch.cat([frame_diarizer.query_pred, diar_preds], dim=1)
+            diar_model_preds_total_list.append(diar_preds)
+
+            # parent_dir = '/home/jinhanw/workdir/workdir_nemo_diarization/sortformer_infer/saved/temp'
+            # os.makedirs(parent_dir, exist_ok=True)
+            # import pickle; import numpy as np;
+            # with open(os.path.join(parent_dir, 'all_diar_preds.pickle'), 'wb') as f:
+            #     pickle.dump(diar_preds, f)
+            # import ipdb; ipdb.set_trace()
+            # break
+   
+
+    # diar_model_preds_total_list = diar_model.preds_total_list
     # torch.save(diar_model.preds_total_list, tensor_path)
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
