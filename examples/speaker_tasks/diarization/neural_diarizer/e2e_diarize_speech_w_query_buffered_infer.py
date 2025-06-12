@@ -318,8 +318,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             diar_model._cfg.test_ds['query_noise_mix_prob'] = cfg.query_noise_mix_prob
             diar_model._cfg.test_ds['query_snr'] = cfg.query_snr
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
-    if 'streaming_mode' in diar_model._cfg:
-        diar_model._cfg.streaming_mode = cfg.get('streaming_mode', False)
+    if 'diar_model_streaming_mode' in diar_model._cfg:
+        diar_model._cfg.diar_model_streaming_mode = cfg.get('diar_model_streaming_mode', False)
+    else:
+        diar_model.streaming_mode = False
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path = get_tensor_path(cfg)
 
@@ -343,7 +345,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     mid_delay = math.ceil((chunk_len + (total_buffer - chunk_len) / 2) / model_stride_in_secs)
     tokens_per_chunk = math.ceil(chunk_len / model_stride_in_secs)
 
-    logging.info(f"Chunk length in secs: {chunk_len}, Total buffer in secs: {total_buffer}")
+    logging.info(f"Chunk length in secs: {chunk_len}, Total buffer in secs: {total_buffer}, Mid delay: {mid_delay}, Tokens per chunk: {tokens_per_chunk}")
     
     #declare framebatcher
     frame_diarizer = FrameBatchDiarizer_tgt_spk(
@@ -351,6 +353,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         frame_len = chunk_len,
         total_buffer = total_buffer,
         batch_size = cfg.batch_size,
+        diar_model_streaming_mode = cfg.diar_model_streaming_mode,
     )
     diar_model_preds_total_list = []
 

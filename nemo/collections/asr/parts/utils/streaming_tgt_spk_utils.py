@@ -70,6 +70,7 @@ class FrameBatchDiarizer_tgt_spk:
         non_target_spk_offset_threshold=0.3, #0.85
         target_spk_onset_threshold=0.3, #0.3
         start_replace_step=3, #wait for x steps before start replacing query, 3 for high throughput, 7 for low latency, overall 3s 
+        diar_model_streaming_mode=False,
 
     ):
         '''
@@ -94,6 +95,7 @@ class FrameBatchDiarizer_tgt_spk:
         self.dynamic_query = dynamic_query
 
         self.frame_buffers = []
+        self.diar_model_streaming_mode = diar_model_streaming_mode
         self.reset()
         cfg = copy.deepcopy(diar_model._cfg)
         self.cfg = cfg
@@ -120,6 +122,7 @@ class FrameBatchDiarizer_tgt_spk:
         self.query_change_once = query_change_once
         self.start_replace_step = start_replace_step
 
+
     def reset(self):
         """
         Reset frame_history and decoder's state
@@ -134,6 +137,32 @@ class FrameBatchDiarizer_tgt_spk:
         self.frame_bufferer.reset()
         self.query_refresh_count = 0
         self.query_refresh_rate = 1
+        if self.diar_model_streaming_mode:
+            assert self.batch_size == 1, "Batch size must be 1 for streaming mode"
+            self._reset_streaming_state(
+                batch_size = self.batch_size,
+                async_streaming = False,
+                device = self.asr_model.device
+            )
+        else:
+            self.asr_model.streaming_mode = False
+
+    def _reset_streaming_state(self, batch_size, async_streaming, device):
+        self.asr_model.streaming_mode = True
+        self.asr_model.sortformer_modules.chunk_len = 376
+        self.asr_model.sortformer_modules.fifo_len = 188
+        self.asr_model.sortformer_modules.spkcache_len = 188
+        self.asr_model.sortformer_modules.query_embs = None
+        self.asr_model.sortformer_modules.query_len = None
+        self.query_len = None
+        self.query_pred = None
+        self.streaming_state = self.asr_model.sortformer_modules.init_streaming_state(
+            batch_size = batch_size,
+            async_streaming = async_streaming,
+            device = device
+        )
+        self.streaming_state.query_pred_len = torch.zeros((batch_size), device=self.asr_model.device, dtype = torch.int32)
+
         # self.asr_model._reset_streaming_state()
 
     def get_partial_samples(self, audio_file: str, offset: float, duration: float, target_sr: int = 16000, dtype: str = 'float32'):
@@ -175,6 +204,9 @@ class FrameBatchDiarizer_tgt_spk:
         self.change_query_action = []
         self.delay = delay
         self.tokens_per_chunk = tokens_per_chunk
+        if self.diar_model_streaming_mode:
+            self.asr_model.sortformer_modules.spkcache_len = self.query_pred_len
+
     def set_frame_reader(self, frame_reader):
         self.frame_bufferer.set_frame_reader(frame_reader)
 
@@ -210,33 +242,89 @@ class FrameBatchDiarizer_tgt_spk:
             feat_signal, feat_signal_len = feat_signal.to(device), feat_signal_len.to(device)
             # forward_outs = self.asr_model(processed_signal=feat_signal, processed_signal_length=feat_signal_len)
             # encoded, encoded_len, _, _ = self.asr_model.train_val_forward([feat_signal, feat_signal_len, None, None, None, None], 0)
-            preds = self.asr_model.forward(audio_signal = feat_signal, audio_signal_length = feat_signal_len)
-            # encoded, encoded_len = self.asr_model.forward_sortformer_streaming(
-            #     signal = feat_signal,
-            #     signal_len = feat_signal_len,
-            #     query_len = self.frame_bufferer.frame_reader.query_audio_signal_len[0],
-            #     chunk_len = self.frame_bufferer.feature_frame_len,
-            #     buffer_len = self.frame_bufferer.feature_buffer_len
-            # )
-
-            # hidden_padding_len = get_hidden_length_from_sample_length(padding_len, 160, 8)
-            # log_probs = log_probs[:,self.query_pred_len-1:-hidden_padding_len+1,:]
-            # predictions = predictions[:,self.query_pred_len-1:-hidden_padding_len+1]
-
-
-            self.asr_model.diar_preds = preds
-
-            # update tailing diar preds with new diar preds
-            if self.all_diar_preds is None:
-                self.all_diar_preds = self.asr_model.diar_preds[:,self.query_pred_len-1:]
+            if self.all_audio is None:
                 self.all_audio = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
-                self.query_pred = self.asr_model.diar_preds[:,:self.query_pred_len]
             else:
-                import numpy as np
-                self.all_diar_preds = F.pad(self.all_diar_preds, (0, 0, 0, int(np.ceil(self.frame_bufferer.feature_frame_len/16000 * 12.5)), 0, 0))
-                self.all_diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:] = self.asr_model.diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:]
                 self.all_audio = F.pad(self.all_audio, (0, self.frame_bufferer.feature_frame_len, 0, 0))
                 self.all_audio[:, -self.frame_bufferer.feature_buffer_len:] = feat_signal[:,int(self.frame_bufferer.frame_reader.query_audio_signal_len[0]):]
+            if not self.diar_model_streaming_mode:
+                preds = self.asr_model.forward(audio_signal = feat_signal, audio_signal_length = feat_signal_len)
+                self.asr_model.diar_preds = preds
+
+                if self.all_diar_preds is None:
+                    self.all_diar_preds = self.asr_model.diar_preds[:,self.query_pred_len-1: self.asr_model.diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]
+                    self.query_pred = self.asr_model.diar_preds[:,:self.query_pred_len]
+                else:
+                    import numpy as np
+                    # self.all_diar_preds = F.pad(self.all_diar_preds, (0, 0, 0, int(np.ceil(self.frame_bufferer.feature_frame_len/16000 * 12.5)), 0, 0))
+                    # self.all_diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:] = self.asr_model.diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:]
+                    self.all_diar_preds = torch.cat([self.all_diar_preds, self.asr_model.diar_preds[:, self.asr_model.diar_preds.shape[1] - 1 - self.delay : self.asr_model.diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]], dim=1)
+                    
+
+            else:
+                import math
+                left_context = 0
+                if self.query_pred is None:
+                    diar_input_signal_len = feat_signal_len
+                    diar_input_signal = feat_signal
+                else:
+                    chunk_len = self.frame_bufferer.feature_frame_len
+                    chunk_len += left_context
+                    diar_input_signal = torch.empty((feat_signal.size(0), chunk_len), 
+                    dtype=feat_signal.dtype,
+                    device=feat_signal.device)
+                    for i in range(feat_signal.size(0)):
+                        diar_input_signal[i,:] = feat_signal[i,feat_signal_len[i] - int(chunk_len):feat_signal_len[i]]
+                    diar_input_signal_len = torch.tensor([int(chunk_len)], device = feat_signal.device).expand(feat_signal.size(0))
+                with torch.no_grad():
+                    # diar_preds = self.forward_diar(signal, signal_len, is_raw_waveform_input)
+                    processed_signal, processed_signal_len = self.asr_model.process_signal(
+                        audio_signal = diar_input_signal,
+                        audio_signal_length = diar_input_signal_len,
+                    )
+                    feat_len = processed_signal.shape[2]
+                    num_chunks = math.ceil(
+                        feat_len / (self.asr_model.sortformer_modules.chunk_len * self.asr_model.sortformer_modules.subsampling_factor)
+                    )
+                    assert num_chunks == 1, "Only one chunk should be used for streaming mode"
+                    streaming_loader = self.asr_model.sortformer_modules.streaming_feat_loader(
+                        feat_seq = processed_signal,
+                        feat_seq_length = processed_signal_len,
+                        feat_seq_offset = 0
+                    )
+                    for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in streaming_loader:
+                        # import ipdb; ipdb.set_trace()
+                        self.streaming_state, chunk_preds = self.asr_model.forward_streaming_step(
+                        processed_signal=chunk_feat_seq_t,
+                        processed_signal_length=feat_lengths,
+                        streaming_state=self.streaming_state,
+                        total_preds=None,
+                        left_offset=left_offset,
+                        right_offset=right_offset,
+                        streaming_level = 'emb',
+                        left_context = left_context,
+                        tokens_per_chunk = self.tokens_per_chunk,
+                        query_len = self.query_pred_len
+                        )
+                if self.all_diar_preds is None:
+                    self.all_diar_preds = self.asr_model.spkcache_fifo_chunk_preds[:,self.query_pred_len-1: self.asr_model.spkcache_fifo_chunk_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]
+                    self.query_pred = self.asr_model.spkcache_fifo_chunk_preds[:,:self.query_pred_len-1]
+                else:
+                    import numpy as np
+                    # self.all_diar_preds = F.pad(self.all_diar_preds, (0, 0, 0, int(np.ceil(self.frame_bufferer.feature_frame_len/16000 * 12.5)), 0, 0))
+                    # self.all_diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:] = self.asr_model.spkcache_fifo_chunk_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:]
+                    self.all_diar_preds = torch.cat([self.all_diar_preds, self.asr_model.spkcache_fifo_chunk_preds[:, self.asr_model.spkcache_fifo_chunk_preds.shape[1] - 1 - self.delay : self.asr_model.spkcache_fifo_chunk_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]], dim=1)
+
+                mid_chunk_preds = self.all_diar_preds[0,self.all_diar_preds.shape[1] - 1 - self.delay : self.all_diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk].clone()
+                # import ipdb; ipdb.set_trace()
+                # for i in range(mid_chunk_preds.shape[0]):
+                #     if sum(mid_chunk_preds[i]) < 1.2 and mid_chunk_preds[i,0] <=0.7:
+                #         mid_chunk_preds[i,0] = 0
+                self.all_diar_preds[:,self.all_diar_preds.shape[1] - 1 - self.delay : self.all_diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk] = mid_chunk_preds
+                # take care of confusion
+                # for i in range(len(mid_chunk_preds[1])):
+                #     if 
+
 
             # # concatenate mid-buffer diar preds (similar to token aggregation)
             # if self.all_diar_preds is None:
@@ -453,8 +541,8 @@ class FrameBatchDiarizer_tgt_spk:
                     pickle.dump(feat_signal_len, f)
                 # with open(os.path.join(parent_dir,'asr_model.cfg'), 'w') as f:
                     # f.write(OmegaConf.to_yaml(self.asr_model.diarization_model._cfg))
-                with open(os.path.join(parent_dir, 'diar_preds.pickle'), 'wb') as f:
-                    pickle.dump(self.asr_model.diar_preds, f)
+                # with open(os.path.join(parent_dir, 'diar_preds.pickle'), 'wb') as f:
+                #     pickle.dump(self.asr_model.diar_preds, f)
                 # with open(os.path.join(parent_dir, 'total_diar_preds.pickle'), 'wb') as f:
                     # pickle.dump(self.asr_model.total_preds, f)
                 # if self.dynamic_query:
@@ -464,6 +552,9 @@ class FrameBatchDiarizer_tgt_spk:
                     pickle.dump(self.all_audio, f)
                 with open(os.path.join(parent_dir, 'new_query.pickle'), 'wb') as f:
                     pickle.dump(self.frame_bufferer.frame_reader.query_audio_signal, f)
+                if self.diar_model_streaming_mode:
+                    with open(os.path.join(parent_dir, 'spkcache_fifo_chunk_preds.pickle'), 'wb') as f:
+                        pickle.dump(self.asr_model.spkcache_fifo_chunk_preds, f)
                 import ipdb; ipdb.set_trace()
 
 
