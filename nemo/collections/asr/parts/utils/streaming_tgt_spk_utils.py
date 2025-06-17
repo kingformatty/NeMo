@@ -315,221 +315,16 @@ class FrameBatchDiarizer_tgt_spk:
                     # self.all_diar_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:] = self.asr_model.spkcache_fifo_chunk_preds[:, -get_hidden_length_from_sample_length(self.frame_bufferer.feature_buffer_len, 160, 8)+2:,:]
                     self.all_diar_preds = torch.cat([self.all_diar_preds, self.asr_model.spkcache_fifo_chunk_preds[:, self.asr_model.spkcache_fifo_chunk_preds.shape[1] - 1 - self.delay : self.asr_model.spkcache_fifo_chunk_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]], dim=1)
 
-                mid_chunk_preds = self.all_diar_preds[0,self.all_diar_preds.shape[1] - 1 - self.delay : self.all_diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk].clone()
-                # import ipdb; ipdb.set_trace()
-                # for i in range(mid_chunk_preds.shape[0]):
-                #     if sum(mid_chunk_preds[i]) < 1.2 and mid_chunk_preds[i,0] <=0.7:
-                #         mid_chunk_preds[i,0] = 0
-                self.all_diar_preds[:,self.all_diar_preds.shape[1] - 1 - self.delay : self.all_diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk] = mid_chunk_preds
-                # take care of confusion
-                # for i in range(len(mid_chunk_preds[1])):
-                #     if 
+                # mid_chunk_preds = self.all_diar_preds[0,self.all_diar_preds.shape[1] - 1 - self.delay : self.all_diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk].clone()
+                # # import ipdb; ipdb.set_trace()
+                # # for i in range(mid_chunk_preds.shape[0]):
+                # #     if sum(mid_chunk_preds[i]) < 1.2 and mid_chunk_preds[i,0] <=0.7:
+                # #         mid_chunk_preds[i,0] = 0
+                # self.all_diar_preds[:,self.all_diar_preds.shape[1] - 1 - self.delay : self.all_diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk] = mid_chunk_preds
+                # # take care of confusion
+                # # for i in range(len(mid_chunk_preds[1])):
+                # #     if 
 
-
-            # # concatenate mid-buffer diar preds (similar to token aggregation)
-            # if self.all_diar_preds is None:
-            #     #initialize all_diar_preds and all_audio
-            #     self.all_diar_preds = self.asr_model.diar_preds[:, self.asr_model.diar_preds.shape[1] - 1 - self.delay : self.asr_model.diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]
-            #     self.all_audio = feat_signal[:, int((self.asr_model.diar_preds.shape[1] - 1 - self.delay) / 12.5 * 16000): int((self.asr_model.diar_preds.shape[1] - 1 - self.delay+ self.tokens_per_chunk) / 12.5 * 16000)]
-            #     self.query_pred = self.asr_model.diar_preds[:,:self.query_pred_len]
-            # else:
-            #     #concatenate new diar_preds and audio
-            #     self.all_diar_preds = torch.cat([self.all_diar_preds, self.asr_model.diar_preds[:, self.asr_model.diar_preds.shape[1] - 1 - self.delay : self.asr_model.diar_preds.shape[1] - 1 - self.delay + self.tokens_per_chunk]], dim=1)
-            #     self.all_audio = torch.cat([self.all_audio, feat_signal[:, int((self.asr_model.diar_preds.shape[1] - 1 - self.delay) / 12.5 * 16000): int((self.asr_model.diar_preds.shape[1] - 1 - self.delay+ self.tokens_per_chunk) / 12.5 * 16000)]], dim=1)
-
-
-            #dynamic query
-            if self.dynamic_query:
-                self.query_refresh_count += 1
-                #select new query from history
-                # Find subrange where first speaker is active and last 3 are inactive
-                diar_preds = self.all_diar_preds.squeeze(0) # Shape [len, 4]
-                first_spk_active = diar_preds[:, 0] > self.target_spk_onset_threshold # High threshold for first speaker
-                other_spks_inactive = torch.all(diar_preds[:, 1:] < self.non_target_spk_offset_threshold, dim=1) # Low threshold for other speakers
-                valid_frames = torch.logical_and(first_spk_active, other_spks_inactive)
-
-                # Helper function to check if a region overlaps with previously selected ones
-                def add_region(start, end):
-                    self.selected_regions.add((start, end))
-                # Helper function to check if a region starts from previous region
-                def no_look_back(start):
-                    if not self.selected_regions:
-                        return True
-                    prev_start, prev_end = max(self.selected_regions) if self.selected_regions else (0, 0)
-                    return start >= prev_end
-
-                strategy = 3
-                search_direction = 'forward' # 'backward
-                # Keep track of previously selected regions to avoid duplicates
-
-                """
-                Strategy 1:
-                    Search for valid from with min_length 3s, starting from the middle of all diar_preds and moving forward / backward, replace the old query with the new query
-                """
-                if strategy == 1:
-                    min_length = self.new_query_min_len
-                    # Start from middle and search forward
-                    start_idx = len(valid_frames) // 2
-                    end_idx = start_idx + min_length - 1
-
-                    # Search forward until we find a valid sequence or reach en
-                    if search_direction == 'forward':
-                        while end_idx < len(valid_frames): 
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio and no_look_back(start_idx):
-                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
-                                add_region(start_idx, end_idx)
-                                break
-                            start_idx += 1
-                            end_idx = start_idx + min_length - 1
-                        replace_query = (end_idx < len(valid_frames))
-                    elif search_direction == 'backward':
-                        while start_idx > 0:
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:
-                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
-                                break
-                            start_idx -= 1
-                            end_idx = start_idx + min_length - 1
-                        replace_query = (start_idx > 0)
-                
-                    if replace_query:
-                        shifted_start_idx = start_idx
-                        shifted_end_idx = end_idx
-                        import numpy as np
-                        # Get candidate new query audio
-                        candidate_query = self.all_audio[0,int(shifted_start_idx/12.5*16000):int(shifted_end_idx/12.5*16000)]
-                        print('Change of query!')
-                        print('Start idx: ', start_idx)
-                        print('End idx: ', end_idx)
-
-                        #replace old query with new query
-                        new_query = np.concatenate([candidate_query.cpu().numpy(), self.separater_audio])
-
-                elif strategy == 2:
-                    """
-                    Strategy 2:
-                        Search for valid from with min_length min_length, starting from the middle of all diar_preds and moving forward / backward, add new query to the start / end of old query and truncate to 5s
-                    """
-                    min_length = self.new_query_min_len
-                    # Start from middle and search forward
-                    start_idx = len(valid_frames) // 2
-                    end_idx = start_idx + min_length - 1
-
-                    # Search forward until we find a valid sequence or reach en
-
-                    if search_direction == 'forward':
-                        while end_idx < len(valid_frames): 
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:# and no_look_back(start_idx):
-                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
-                                add_region(start_idx, end_idx)
-                                break
-                            start_idx += 1
-                            end_idx = start_idx + min_length - 1
-                        replace_query = (end_idx < len(valid_frames))
-                    elif search_direction == 'backward':
-                        while start_idx > 0:
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:
-                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
-                                break
-                            start_idx -= 1
-                            end_idx = start_idx + min_length - 1
-                        replace_query = (start_idx > 0)
-                    if replace_query:
-                        shifted_start_idx = start_idx
-                        shifted_end_idx = end_idx
-                        import numpy as np
-                        # Get candidate new query audio
-                        candidate_query = self.all_audio[0,int(shifted_start_idx/12.5*16000):int(shifted_end_idx/12.5*16000)]
-                        print('Change of query!')
-                        print('Start idx: ', start_idx)
-                        print('End idx: ', end_idx)
-
-                        #replace old query with new query
-                        # new_query = np.concatenate([candidate_query.cpu().numpy(), self.separater_audio])
-                        #concatenate to the end of old query
-                        new_query = np.concatenate([self.frame_bufferer.frame_reader._query_samples[:-len(self.separater_audio)], candidate_query.cpu().numpy(), self.separater_audio])
-                        new_query = new_query[-int(self.new_query_max_len*16000):]
-                        self.change_query_action.append(0)
-                    else:
-                        self.change_query_action.append(0)
-                        #concatenate to the start of old query
-                        # new_query = np.concatenate([candidate_query.cpu().numpy(), self.frame_bufferer.frame_reader._query_samples[:-len(self.separater_audio)]])
-                        # new_query = new_query[:int(5*16000)]
-                        # new_query = np.concatenate([new_query, self.separater_audio])
-                elif strategy == 3:
-                    """
-                    Strategy 3:
-                        Search for valid from with min_length to max_length, starting from the middle of all diar_preds and moving forward / backward, replace old query with the new query, if valid_sequence is short, repeat the valid_sequence to max_length
-                    """
-                    min_length = self.new_query_min_len
-                    max_length = 25
-                    # Start from middle and search forward
-                    start_idx = 0 #len(valid_frames) // 2
-                    end_idx = start_idx + min_length - 1
-
-                    # Search forward until we find a valid sequence or reach en
-                    if search_direction == 'forward':
-                        while end_idx < len(valid_frames): 
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:# and torch.all(valid_frames[end_idx-6:end_idx+1]):# and no_look_back(start_idx):
-                                # Try extending end_idx up to max_length while maintaining activation ratio
-                                anchored_end_index = end_idx
-                                temp_end_idx = end_idx
-                                while temp_end_idx < min(len(valid_frames), start_idx + max_length):
-                                    if torch.sum(valid_frames[anchored_end_index:temp_end_idx+1]) / (temp_end_idx - anchored_end_index + 1) > self.activation_ratio:
-                                        end_idx = temp_end_idx
-                                        temp_end_idx += 1
-                                    else:
-                                        break
-                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
-                                # add_region(start_idx, end_idx)
-                                break
-                            start_idx += 1
-                            end_idx = start_idx + min_length - 1
-                        replace_query = (end_idx < len(valid_frames)) if len(self.change_query_action) >= self.start_replace_step else False
-                    elif search_direction == 'backward':
-                        while start_idx > 0:
-                            if torch.sum(valid_frames[start_idx:end_idx+1]) / (end_idx - start_idx + 1) > self.activation_ratio:
-                                # and  torch.all(valid_frames[end_idx-6:end_idx+1])):
-                                break
-                            start_idx -= 1
-                            end_idx = start_idx + min_length - 1
-                        replace_query = (start_idx > 0)
-                
-                    if replace_query:
-                        shifted_start_idx = start_idx # 6 frames after the valid sequence
-                        shifted_end_idx = end_idx # 6 frames before the valid sequence
-                        import numpy as np
-                        # Get candidate new query audio
-                        candidate_query = self.all_audio[0,int(shifted_start_idx/12.5*16000):int(shifted_end_idx/12.5*16000)]
-                        # If candidate query is shorter than 2s (32000 samples), repeat to make it 3s (48000 samples)
-                        if len(candidate_query) < 32000:
-                            repeats = int(np.ceil(48000 / len(candidate_query)))
-                            candidate_query = candidate_query.repeat(repeats)[:48000]
-                        self.change_query_action.append(1) if self.query_refresh_count >= self.query_refresh_rate else self.change_query_action.append(0)
-
-                        #replace old query with new query
-                        new_query = np.concatenate([candidate_query.cpu().numpy(), self.separater_audio])
-                    else:
-                        self.change_query_action.append(0)
-                    
-            #manipulate audio
-            # query_audio = feat_signal[0][-16000:].repeat(2)
-            # changed_feat_signal = torch.cat([query_audio.unsqueeze(0), feat_signal[0][64000:].unsqueeze(0)], dim=1)
-            # feat_signal = changed_feat_signal
-            # feat_signal_len = torch.Tensor([changed_feat_signal.shape[1]]).to(device)
-            
-                if replace_query and self.query_refresh_count >= self.query_refresh_rate:
-                    print('Change of query!')
-                    print('Start idx: ', start_idx)
-                    print('End idx: ', end_idx)
-                    self.frame_bufferer.frame_reader._query_samples = new_query
-                    self.frame_bufferer.frame_reader.query_audio_signal = torch.from_numpy(self.frame_bufferer.frame_reader._query_samples).unsqueeze_(0).to(device)
-                    self.frame_bufferer.frame_reader.query_audio_signal_len = torch.Tensor([self.frame_bufferer.frame_reader.query_audio_signal.shape[1]]).to(device)
-                    self.query_pred_len = get_hidden_length_from_sample_length(self.frame_bufferer.frame_reader.query_audio_signal_len, 160, 8)
-                    self.query_refresh_count = 0
-                    if self.query_change_once:
-                        self.query_refresh_rate = np.inf
-
-            
             save_intermediate_var = False
             if save_intermediate_var:
                 parent_dir = '/home/jinhanw/workdir/workdir_nemo_diarization/sortformer_infer/saved/temp'
@@ -541,8 +336,8 @@ class FrameBatchDiarizer_tgt_spk:
                     pickle.dump(feat_signal_len, f)
                 # with open(os.path.join(parent_dir,'asr_model.cfg'), 'w') as f:
                     # f.write(OmegaConf.to_yaml(self.asr_model.diarization_model._cfg))
-                # with open(os.path.join(parent_dir, 'diar_preds.pickle'), 'wb') as f:
-                #     pickle.dump(self.asr_model.diar_preds, f)
+                with open(os.path.join(parent_dir, 'diar_preds.pickle'), 'wb') as f:
+                    pickle.dump(self.asr_model.diar_preds, f)
                 # with open(os.path.join(parent_dir, 'total_diar_preds.pickle'), 'wb') as f:
                     # pickle.dump(self.asr_model.total_preds, f)
                 # if self.dynamic_query:
@@ -550,8 +345,6 @@ class FrameBatchDiarizer_tgt_spk:
                     pickle.dump(self.all_diar_preds, f)
                 with open(os.path.join(parent_dir, 'all_audio.pickle'), 'wb') as f:
                     pickle.dump(self.all_audio, f)
-                with open(os.path.join(parent_dir, 'new_query.pickle'), 'wb') as f:
-                    pickle.dump(self.frame_bufferer.frame_reader.query_audio_signal, f)
                 if self.diar_model_streaming_mode:
                     with open(os.path.join(parent_dir, 'spkcache_fifo_chunk_preds.pickle'), 'wb') as f:
                         pickle.dump(self.asr_model.spkcache_fifo_chunk_preds, f)
@@ -566,26 +359,12 @@ class AudioIterator_tgt_spk(IterableDataset):
         self.output = True
         self.count = 0
         self.pad_to_frame_len = pad_to_frame_len
-        # timestep_duration = preprocessor._cfg['window_stride']
-        # self._feature_frame_len = frame_len / timestep_duration
         self._feature_frame_len = frame_len * 16000
         self.audio_signal = torch.from_numpy(self._samples).unsqueeze_(0).to(device)
         self.audio_signal_len = torch.Tensor([self._samples.shape[0]]).to(device)
-        # self._features, self._features_len = preprocessor(
-        #     input_signal=audio_signal,
-        #     length=audio_signal_len,
-        # )
-        # self._features = self._features.squeeze()
-        # super().__init__(samples, frame_len, preprocessor, device, pad_to_frame_len)
-        #init query signal and len
         self._query_samples = query_samples
         self.query_audio_signal = torch.from_numpy(self._query_samples).unsqueeze_(0).to(device)
         self.query_audio_signal_len = torch.Tensor([self._query_samples.shape[0]]).to(device)
-        # import ipdb; ipdb.set_trace()
-        # self._query_features, self._query_features_len = preprocessor(
-        #     input_signal=query_audio_signal,
-        #     length=query_audio_signal_len,
-        # )
 
     def __iter__(self):
         return self

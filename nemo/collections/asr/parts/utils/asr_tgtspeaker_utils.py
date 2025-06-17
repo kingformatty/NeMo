@@ -95,7 +95,7 @@ def speaker_to_target_w_query(
             rttms = SupervisionSet.from_segments([SupervisionSegment(
                 id=uuid4(),
                 recording_id=cut.recording_id,
-                start=0,
+                start=cut.start,
                 duration=cut.duration,
                 channel=1,
                 speaker=cut.speaker_id,
