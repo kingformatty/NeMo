@@ -56,6 +56,7 @@ import math
 
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models_w_query import SortformerEncLabelWQueryModel
+from nemo.collections.asr.models.sortformer_titanet_diar_models_w_query import SortformerTitanetEncLabelWQueryModel
 from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
     load_postprocessing_from_yaml,
@@ -112,6 +113,7 @@ class DiarizationConfig:
     query_noise_mix_prob: float = 0.3
     query_snr: Tuple[float, float] = (2.5, 12.5)
     eval_query_speaker_only: bool = False
+    use_sortformer_titanet: bool = False
 
 
 def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial: optuna.Trial) -> PostProcessingParams:
@@ -282,14 +284,24 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    if cfg.model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelWQueryModel.load_from_checkpoint(
-            checkpoint_path=cfg.model_path, map_location=map_location, strict=False
-        )
-    elif cfg.model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelWQueryModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+    if cfg.use_sortformer_titanet:
+        if cfg.model_path.endswith(".ckpt"):
+            diar_model = SortformerTitanetEncLabelWQueryModel.load_from_checkpoint(
+                checkpoint_path=cfg.model_path, map_location=map_location, strict=False
+            )
+        elif cfg.model_path.endswith(".nemo"):
+            diar_model = SortformerTitanetEncLabelWQueryModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        else:
+            raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
     else:
-        raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
+        if cfg.model_path.endswith(".ckpt"):
+            diar_model = SortformerEncLabelWQueryModel.load_from_checkpoint(
+                checkpoint_path=cfg.model_path, map_location=map_location, strict=False
+            )
+        elif cfg.model_path.endswith(".nemo"):
+            diar_model = SortformerEncLabelWQueryModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        else:
+            raise ValueError("cfg.model_path must end with.ckpt or.nemo!")        
 
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
@@ -310,8 +322,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             diar_model._cfg.test_ds['query_noise_mix_prob'] = cfg.query_noise_mix_prob
             diar_model._cfg.test_ds['query_snr'] = cfg.query_snr
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
-    if 'streaming_mode' in diar_model._cfg:
-        diar_model._cfg.streaming_mode = cfg.get('streaming_mode', False)
+    if 'diar_model_streaming_mode' in diar_model._cfg:
+        diar_model._cfg.diar_model_streaming_mode = cfg.get('diar_model_streaming_mode', False)
+    else:
+        diar_model.streaming_mode = False
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path = get_tensor_path(cfg)
 

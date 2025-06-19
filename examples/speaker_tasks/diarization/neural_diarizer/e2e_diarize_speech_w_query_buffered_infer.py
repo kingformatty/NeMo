@@ -56,6 +56,7 @@ import math
 
 from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models_w_query import SortformerEncLabelWQueryModel
+from nemo.collections.asr.models.sortformer_titanet_diar_models_w_query import SortformerTitanetEncLabelWQueryModel
 
 from nemo.collections.asr.parts.utils.vad_utils import (
     PostProcessingParams,
@@ -116,6 +117,7 @@ class DiarizationConfig:
     eval_query_speaker_only: bool = False
     chunk_len_in_secs: float = 1.0
     total_buffer_in_secs: float = 4.0
+    use_sortformer_titanet: bool = False
 
 
 
@@ -290,14 +292,24 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    if cfg.model_path.endswith(".ckpt"):
-        diar_model = SortformerEncLabelWQueryModel.load_from_checkpoint(
-            checkpoint_path=cfg.model_path, map_location=map_location, strict=False
-        )
-    elif cfg.model_path.endswith(".nemo"):
-        diar_model = SortformerEncLabelWQueryModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+    if cfg.use_sortformer_titanet:
+        if cfg.model_path.endswith(".ckpt"):
+            diar_model = SortformerTitanetEncLabelWQueryModel.load_from_checkpoint(
+                checkpoint_path=cfg.model_path, map_location=map_location, strict=False
+            )
+        elif cfg.model_path.endswith(".nemo"):
+            diar_model = SortformerTitanetEncLabelWQueryModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        else:
+            raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
     else:
-        raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
+        if cfg.model_path.endswith(".ckpt"):
+            diar_model = SortformerEncLabelWQueryModel.load_from_checkpoint(
+                checkpoint_path=cfg.model_path, map_location=map_location, strict=False
+            )
+        elif cfg.model_path.endswith(".nemo"):
+            diar_model = SortformerEncLabelWQueryModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
+        else:
+            raise ValueError("cfg.model_path must end with.ckpt or.nemo!")       
 
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator)

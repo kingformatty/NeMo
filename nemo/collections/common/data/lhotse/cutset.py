@@ -201,6 +201,7 @@ def read_dataset_config(config) -> tuple[CutSet, bool]:
     if isinstance(input_cfg, (str, Path)):
         # Resolve /path/to/input_cfg.yaml into config contents if needed.
         input_cfg = OmegaConf.load(input_cfg)
+        logging.info(f"Using external input config: {input_cfg}")
     cuts, is_tarred = parse_and_combine_datasets(input_cfg, propagate_attrs=propagate_attrs)
     return cuts, is_tarred
 
@@ -640,6 +641,8 @@ def read_target_speaker_simulator(config: DictConfig) -> tuple[CutSet, bool]:
             non_query_sample=config.get("non_query_sample", False),
             query_duration=config.get("query_duration", [3, 10]),
             mono_duration=config.get("mono_duration", [0.5, 20]),
+            initial_offset=config.get("initial_offset", 2),
+            padding_silence_duration=config.get("padding_silence_duration", [0, 0]),
         )
     )
 

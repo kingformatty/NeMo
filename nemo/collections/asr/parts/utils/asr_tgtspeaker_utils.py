@@ -19,7 +19,7 @@ from nltk.tokenize import SyllableTokenizer
 
 import torch.utils.data
 from lhotse.cut.set import mix
-from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack
+from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, MixTrack, PaddingCut
 from lhotse import SupervisionSet, SupervisionSegment, dill_enabled, AudioSource, Recording
 from lhotse.utils import uuid4, compute_num_samples
 from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
@@ -327,7 +327,9 @@ class TargetSpeakerSimulator():
         max_delay_after_each_mono: float = 0,
         non_query_sample: bool = False,
         query_duration: List[float] = [3, 10],
-        mono_duration: List[float] = [0.5, 20]
+        mono_duration: List[float] = [0.5, 20],
+        initial_offset: float = 2,
+        padding_silence_duration: List[float] = [0, 0]
     ):
         """
         Args:
@@ -359,6 +361,8 @@ class TargetSpeakerSimulator():
         self.query_duration = query_duration
         self.non_query_sample = non_query_sample
         self.mono_duration = mono_duration
+        self.initial_offset = initial_offset
+        self.padding_silence_duration = padding_silence_duration
 
         self.spk2manifests = groupby(lambda x: x["speaker_id"], self.manifests)
         self.speaker_ids = list(self.spk2manifests.keys())
@@ -392,8 +396,7 @@ class TargetSpeakerSimulator():
             mono_cuts.append(json_to_cut(manifest))
 
         tracks = []
-        initial_offset = 2
-        offset = random.uniform(0.0, initial_offset)
+        offset = random.uniform(0.0, self.initial_offset)
         for mono_cut in mono_cuts:
             custom = {
                     'pnc': 'no',
@@ -436,7 +439,8 @@ class TargetSpeakerSimulator():
                     }
         mixed_cut.tracks[0].cut.supervisions = [sup]
         mixed_cut.tracks[0].cut.custom.update(custom)
-        
+        if self.padding_silence_duration[1] > 0:
+            mixed_cut = mixed_cut.pad(duration = mixed_cut.duration + random.uniform(self.padding_silence_duration[0], self.padding_silence_duration[1]))
         return mixed_cut
 
     def MeetingSimulator(self):
