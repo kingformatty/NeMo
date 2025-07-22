@@ -71,12 +71,9 @@ class MockDataModule(pl.LightningDataModule):
         self.image_precached = image_precached
         self.text_precached = text_precached
         self.global_batch_size = global_batch_size
-        self.micro_batch_size = micro_batch_size
-        self.tokenizer = None
-        self.seq_length = 10
 
         self.data_sampler = MegatronDataSampler(
-            seq_len=self.seq_length,
+            seq_len=10,
             micro_batch_size=micro_batch_size,
             global_batch_size=global_batch_size,
             rampup_batch_size=rampup_batch_size,

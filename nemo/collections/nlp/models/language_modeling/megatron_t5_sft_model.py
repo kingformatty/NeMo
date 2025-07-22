@@ -27,14 +27,7 @@ from omegaconf import DictConfig, ListConfig
 from nemo.collections.common.data import ConcatMapDataset
 from nemo.collections.common.metrics import MetricStringToTorchMetric
 from nemo.collections.common.metrics.classification_accuracy import ExactStringPerCategoryMatchMetric
-
-try:
-    from nemo.collections.nlp.data.common.sequence_to_sequence_dataset import SequenceToSequenceDataset
-except ModuleNotFoundError:
-    from abc import ABC
-
-    SequenceToSequenceDataset = ABC
-
+from nemo.collections.nlp.data.common.sequence_to_sequence_dataset import SequenceToSequenceDataset
 from nemo.collections.nlp.data.language_modeling.megatron.t5_sft_dataset import T5SFTDataset
 from nemo.collections.nlp.models.language_modeling.megatron_t5_model import MegatronT5Model, T5Sentinel
 from nemo.collections.nlp.modules.common.megatron.utils import get_iterator_k_split

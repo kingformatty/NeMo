@@ -32,6 +32,7 @@ from nemo.export.multimodal.build import (
     extract_lora_ckpt,
 )
 from nemo.export.multimodal.run import MultimodalModelRunner, SpeechllmModelRunner
+from nemo.export.tarutils import unpack_tarball
 
 use_deploy = True
 try:
@@ -151,7 +152,8 @@ class TensorRTMMExporter(ITritonDeployable):
                 if os.path.isdir(lora_checkpoint_path):
                     lora_dir = lora_checkpoint_path
                 else:
-                    raise ValueError("lora_checkpoint_path in nemo1 is not supported. It must be a directory")
+                    lora_dir = os.path.join(tmp_dir.name, "unpacked_lora")
+                    unpack_tarball(lora_checkpoint_path, lora_dir)
 
                 llm_lora_path = [extract_lora_ckpt(lora_dir, tmp_dir.name)]
             else:

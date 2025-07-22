@@ -146,7 +146,7 @@ def flux_training() -> run.Partial:
 
 
 @run.cli.factory(target=llm.train)
-def convergence_test(custom_fsdp=True) -> run.Partial:
+def convergence_test() -> run.Partial:
     '''
     A convergence recipe with real data loader.
     Image and text embedding calculated on the fly.
@@ -161,10 +161,15 @@ def convergence_test(custom_fsdp=True) -> run.Partial:
     recipe.trainer.devices = 8
     recipe.data = flux_datamodule('/dataset/fill50k/fill50k_tarfiles/')
     recipe.trainer.max_steps = 30000
-    if custom_fsdp is True:
-        configure_custom_fsdp(recipe)
-    else:
-        configure_ddp(recipe)
+    recipe.trainer.strategy.ddp = run.Config(
+        DistributedDataParallelConfig,
+        use_custom_fsdp=True,
+        data_parallel_sharding_strategy='optim_grads_params',
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=True,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+    )
 
     return recipe
 
@@ -189,7 +194,7 @@ def full_model_tp2_dp4_mock() -> run.Partial:
 
 
 @run.cli.factory(target=llm.train)
-def fp8_test(custom_fsdp=True) -> run.Partial:
+def fp8_test() -> run.Partial:
     '''
     Basic functional test, with mock dataset,
     text/vae encoders not initialized, ddp strategy,
@@ -209,10 +214,11 @@ def fp8_test(custom_fsdp=True) -> run.Partial:
         num_single_layers=10,
     )
     recipe.data.global_batch_size = 8
-    if custom_fsdp:
-        configure_custom_fsdp(recipe)
-    else:
-        configure_ddp(recipe)
+    recipe.trainer.strategy.ddp = run.Config(
+        DistributedDataParallelConfig,
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=True,
+    )
     recipe.trainer.plugins = run.Config(
         nl.MegatronMixedPrecision,
         precision="bf16-mixed",
@@ -226,42 +232,14 @@ def fp8_test(custom_fsdp=True) -> run.Partial:
     return recipe
 
 
-def configure_custom_fsdp(recipe) -> run.Partial:
-    recipe.trainer.strategy.ddp = run.Config(
-        DistributedDataParallelConfig,
-        use_custom_fsdp=True,
-        data_parallel_sharding_strategy='optim_grads_params',  # Custom FSDP
-        check_for_nan_in_grad=True,
-        grad_reduce_in_fp32=True,
-        overlap_param_gather=True,  # Custom FSDP requires this
-        overlap_grad_reduce=True,  # Custom FSDP requires this
-    )
-    recipe.trainer.strategy.fsdp = 'megatron'
-    return recipe
-
-
-def configure_ddp(recipe) -> run.Partial:
-    recipe.trainer.strategy.ddp = run.Config(
-        DistributedDataParallelConfig,
-        check_for_nan_in_grad=True,
-        grad_reduce_in_fp32=True,
-    )
-    recipe.trainer.strategy.fsdp = None
-    return recipe
-
-
 @run.cli.factory(target=llm.train)
-def unit_test(custom_fsdp=True) -> run.Partial:
+def unit_test() -> run.Partial:
     '''
     Basic functional test, with mock dataset,
     text/vae encoders not initialized, ddp strategy,
     frozen and trainable layers both set to 1
     '''
     recipe = flux_training()
-    if custom_fsdp:
-        recipe = configure_custom_fsdp(recipe)
-    else:
-        recipe = configure_ddp(recipe)
     recipe.model.flux_params.t5_params = None  # run.Config(T5Config, version='/ckpts/text_encoder_2')
     recipe.model.flux_params.clip_params = None  # run.Config(ClipConfig, version='/ckpts/text_encoder')
     recipe.model.flux_params.vae_config = (
@@ -270,6 +248,11 @@ def unit_test(custom_fsdp=True) -> run.Partial:
     recipe.model.flux_params.device = 'cuda'
     recipe.model.flux_params.flux_config = run.Config(FluxConfig, num_joint_layers=1, num_single_layers=1)
     recipe.data.global_batch_size = 1
+    recipe.trainer.strategy.ddp = run.Config(
+        DistributedDataParallelConfig,
+        check_for_nan_in_grad=True,
+        grad_reduce_in_fp32=True,
+    )
     recipe.trainer.max_steps = 100
     return recipe
 

@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pylint: skip-file
-
 import json
 import math
 from typing import Dict, Optional
@@ -28,13 +26,7 @@ from nemo.collections.common.losses import SmoothedCrossEntropyLoss
 from nemo.collections.common.metrics import GlobalAverageLossMetric
 from nemo.collections.common.parts import transformer_weights_init
 from nemo.collections.nlp.data import SentenceDataset, TarredSentenceDataset
-
-try:
-    from nemo.collections.nlp.metrics import SequencePerplexity
-except (ImportError, ModuleNotFoundError):
-    from abc import ABC
-
-    SequencePerplexity = ABC
+from nemo.collections.nlp.metrics import SequencePerplexity
 from nemo.collections.nlp.modules.common import TokenClassifier
 from nemo.collections.nlp.modules.common.lm_utils import get_transformer
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_tokenizer

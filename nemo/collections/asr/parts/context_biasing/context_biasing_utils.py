@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
 import os
 from typing import List, Union
@@ -149,10 +150,7 @@ def merge_alignment_with_ws_hyps(
 
 
 def compute_fscore(
-    recognition_results_manifest: str,
-    key_words_list: List,
-    eps: str = "<eps>",
-    print_stats: bool = False,
+    recognition_results_manifest: str, key_words_list: List, eps: str = "<eps>"
 ) -> tuple[float, float, float]:
     """
     Compute fscore for list of context biasing words/phrases.
@@ -254,25 +252,22 @@ def compute_fscore(
     recall = tp / (gt + 1e-8)
     fscore = 2 * (precision * recall) / (precision + recall + 1e-8)
 
-    if print_stats:
-        logging.info("=" * 60)
-        logging.info("Per words statistic (word: correct/totall | false positive):\n")
+    logging.info("=" * 60)
+    logging.info("Per words statistic (word: correct/totall | false positive):\n")
     max_len = max([len(x) for x in key_words_stat if key_words_stat[x][1] > 0 or key_words_stat[x][2] > 0])
     for word in key_words_list:
         if key_words_stat[word][1] > 0 or key_words_stat[word][2] > 0:
             false_positive = ""
             if key_words_stat[word][2] > 0:
                 false_positive = key_words_stat[word][2]
-            if print_stats:
-                logging.info(
-                    f"{word:>{max_len}}: {key_words_stat[word][0]:3}/{key_words_stat[word][1]:<3} |{false_positive:>3}"
-                )
-    if print_stats:
-        logging.info("=" * 60)
-        logging.info("=" * 60)
-        logging.info(f"Precision: {precision:.4f} ({tp}/{tp + fp}) fp:{fp}")
-        logging.info(f"Recall:    {recall:.4f} ({tp}/{gt})")
-        logging.info(f"Fscore:    {fscore:.4f}")
-        logging.info("=" * 60)
+            logging.info(
+                f"{word:>{max_len}}: {key_words_stat[word][0]:3}/{key_words_stat[word][1]:<3} |{false_positive:>3}"
+            )
+    logging.info("=" * 60)
+    logging.info("=" * 60)
+    logging.info(f"Precision: {precision:.4f} ({tp}/{tp + fp}) fp:{fp}")
+    logging.info(f"Recall:    {recall:.4f} ({tp}/{gt})")
+    logging.info(f"Fscore:    {fscore:.4f}")
+    logging.info("=" * 60)
 
     return (precision, recall, fscore)

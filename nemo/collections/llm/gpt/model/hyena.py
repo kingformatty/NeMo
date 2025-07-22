@@ -23,7 +23,6 @@ from typing import Callable, Literal, Optional, Type
 
 import torch
 from megatron.core import parallel_state
-from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 from megatron.core.transformer.enums import AttnBackend
@@ -37,18 +36,6 @@ from nemo.lightning import get_vocab_size, io, teardown
 from nemo.lightning.base import NEMO_MODELS_CACHE
 from nemo.lightning.io.state import TransformFns
 from nemo.utils import logging
-
-
-class HyenaInferenceContext(StaticInferenceContext):
-    """Hyena-specific inference context."""
-
-    def reset(self):
-        """Reset the inference context."""
-        super().reset()  # standard state reset for GPT models
-        for key in dir(self):
-            # Remove all of the state that we add in hyena.py
-            if "filter_state_dict" in key:
-                delattr(self, key)
 
 
 class HyenaModel(GPTModel):
@@ -101,11 +88,9 @@ class HyenaModel(GPTModel):
             inference_batch_times_seqlen_threshold=inference_batch_times_seqlen_threshold,
             padded_vocab_size=vocab_size,
             inference_max_seq_length=inference_max_seq_length,
-            inference_max_requests=1,
         )
 
-        inference_context = HyenaInferenceContext.from_config(inference_wrapper_config)
-        model_inference_wrapper = GPTInferenceWrapper(mcore_model, inference_wrapper_config, inference_context)
+        model_inference_wrapper = GPTInferenceWrapper(mcore_model, inference_wrapper_config)
         return model_inference_wrapper
 
     def forward(
@@ -482,7 +467,6 @@ class Hyena7bARCLongContextConfig(Hyena7bConfig):
     due to constraintes from large TP size for training."""
 
     ffn_hidden_size: int = 11264
-    seq_len_interpolation_factor: float = 128
 
 
 @dataclass
@@ -491,7 +475,6 @@ class Hyena40bARCLongContextConfig(Hyena40bConfig):
     due to constraintes from large TP size for training."""
 
     ffn_hidden_size: int = 22528
-    seq_len_interpolation_factor: float = 128
 
 
 @io.model_importer(HyenaModel, "pytorch")
