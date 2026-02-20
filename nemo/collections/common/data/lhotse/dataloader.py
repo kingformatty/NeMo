@@ -148,6 +148,9 @@ class LhotseDataLoadingConfig:
     noise_mix_prob: float = 0.5
     #   b. On-the-fly 3-way speed perturbation.
     perturb_speed: bool = False
+    #   b.2 on-the-fly 3-way volume perturbation
+    perturb_volume: bool = False
+    volume_factor: tuple[float, float] = (0.1, 10)
     #   c. Cut concatenation (glue together multiple utterances into a single one)
     concatenate_samples: bool = False
     concatenate_gap_seconds: float = 0.1
@@ -175,6 +178,8 @@ class LhotseDataLoadingConfig:
     #   f. Padding to a minimum duration. Examples shorter than this will be padded, others are unaffected.
     pad_min_duration: Optional[float] = None
     pad_direction: str = "right"  # "right" | "left" | "both" | "random"
+    #   g. Telephony augmentation
+    telephony_aug: bool = False
 
     # 5. Other Lhotse options.
     text_field: str = "text"  # key to read the transcript from
@@ -492,8 +497,13 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
             if not isinstance(tokenizer, TokenizerWrapper):
                 tokenizer = TokenizerWrapper(tokenizer)
             cuts = cuts.map(partial(tokenize, tokenizer=tokenizer), apply_fn=None)
-
     # 2. Optional augmentations.
+    # 2.g 
+    if config.telephony_aug:
+        cuts = CutSet.mux(
+            cuts,
+            cuts.telephony_aug(1) # this factor number is not used yet
+        )
     # 2.a. Noise mixing.
     if config.noise_path is not None:
         noise = guess_parse_cutset(config.noise_path)
@@ -514,6 +524,13 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
             cuts,
             cuts.perturb_speed(0.9),
             cuts.perturb_speed(1.1),
+        )
+    
+    if config.perturb_volume:
+        cuts = CutSet.mux(
+            cuts,
+            cuts.perturb_volume(config.volume_factor[0]),
+            cuts.perturb_volume(config.volume_factor[1]),
         )
 
     # 2.d: truncation/slicing
