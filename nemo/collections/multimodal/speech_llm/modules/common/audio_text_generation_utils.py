@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,22 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
 
 """Utilities for generating text."""
 
-import pickle
+import json
+import sys
 from collections.abc import Iterable
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-import nemo.collections.nlp.modules.common.text_generation_utils as text_generation_utils
+if TYPE_CHECKING:
+    import nemo.collections.multimodal.speech_llm.modules.common.text_generation_utils as text_generation_utils
+
 from nemo.collections.common.tokenizers.tabular_tokenizer import TabularTokenizer
 from nemo.collections.multimodal.speech_llm.modules.common.audio_text_generation_strategy import (
     model_inference_strategy_dispatcher,
 )
-from nemo.collections.nlp.modules.common.transformer.text_generation import OutputType
 from nemo.utils import AppState, logging
 
 try:
@@ -47,10 +52,24 @@ except (ImportError, ModuleNotFoundError):
         _reconfigure_microbatch_calculator as reconfigure_num_microbatches_calculator,
     )
 
+if sys.version_info >= (3, 8):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
+
 __all__ = [
     "get_computeprob_response",
     "generate",
 ]
+
+
+class OutputType(TypedDict):
+    sentences: List[str]  # output sentences
+    tokens: List[List[str]]  # output sentences borken into tokens
+    logprob: List[List[float]]  # log prob of generated tokens
+    full_logprob: List[List[float]]  # log prob of all the tokens in the vocab
+    token_ids: List[List[int]]  # output sentence token ids
+    offsets: List[List[int]]  # list of tokens start positions in text
 
 
 def get_computeprob_response(tokenizer, response, inputs):
@@ -110,7 +129,7 @@ def send_generate_info(
 
     # send end strings
     string_tensor = torch.as_tensor(
-        np.frombuffer(pickle.dumps(end_strings), dtype=np.int8), device=torch.cuda.current_device()
+        np.frombuffer(json.dumps(end_strings).encode('utf-8'), dtype=np.int8), device=torch.cuda.current_device()
     )
     size = torch.as_tensor([string_tensor.size(0)], device=torch.cuda.current_device(), dtype=torch.int64)
     torch.distributed.broadcast(size, src, model_parallel_group)
@@ -121,7 +140,8 @@ def send_generate_info(
 
     if context_start_idx is not None:
         context_idx_tensor = torch.as_tensor(
-            np.frombuffer(pickle.dumps(context_start_idx), dtype=np.int8), device=torch.cuda.current_device()
+            np.frombuffer(json.dumps(context_start_idx).encode('utf-8'), dtype=np.int8),
+            device=torch.cuda.current_device(),
         )
         ctx_size = torch.as_tensor([context_idx_tensor.size(0)], device=torch.cuda.current_device(), dtype=torch.int64)
         torch.distributed.broadcast(ctx_size, src, model_parallel_group)
@@ -167,7 +187,7 @@ def receive_generate_info(has_multi_audios=False):
     string_tensor = torch.empty(array_size[0], dtype=torch.int8, device=torch.cuda.current_device())
     torch.distributed.broadcast(string_tensor, src, model_parallel_group)
     bytes = string_tensor.cpu().numpy().tobytes()
-    end_strings = pickle.loads(bytes)
+    end_strings = json.loads(bytes.decode('utf-8'))
 
     num_audios = None
     context_start_idx = None
@@ -180,7 +200,7 @@ def receive_generate_info(has_multi_audios=False):
         context_idx_tensor = torch.empty(array_size[0], dtype=torch.int8, device=torch.cuda.current_device())
         torch.distributed.broadcast(context_idx_tensor, src, model_parallel_group)
         bytes = context_idx_tensor.cpu().numpy().tobytes()
-        context_start_idx = pickle.loads(bytes)
+        context_start_idx = json.loads(bytes.decode('utf-8'))
 
     return (
         context_length_tensor,

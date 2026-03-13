@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
 
 import math
 import os
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Optional
 
 import lightning.pytorch as L
 import numpy as np
 import torch
-from diffusers import FluxTransformer2DModel
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.models.common.vision_module.vision_module import VisionModule
@@ -65,7 +67,7 @@ def flux_data_step(dataloader_iter):
     else:
         _batch = batch
 
-    _batch['loss_mask'] = torch.Tensor([1.0]).cuda(non_blocking=True)
+    _batch['loss_mask'] = torch.ones(1, device="cuda")
     return _batch
 
 
@@ -89,11 +91,16 @@ class FluxConfig(TransformerConfig, io.IOMixin):
     guidance_embed: bool = False
     vec_in_dim: int = 768
     rotary_interleaved: bool = True
+    apply_rope_fusion: bool = False
     layernorm_epsilon: float = 1e-06
     hidden_dropout: float = 0
     attention_dropout: float = 0
     use_cpu_initialization: bool = True
-    gradient_accumulation_fusion: bool = True
+    gradient_accumulation_fusion: bool = False
+    enable_cuda_graph: bool = False
+    cuda_graph_scope: Optional[str] = None  # full, full_iteration
+    use_te_rng_tracker: bool = False
+    cuda_graph_warmup_steps: int = 2
 
     guidance_scale: float = 3.5
     data_step_fn: Callable = flux_data_step
@@ -113,8 +120,9 @@ class T5Config:
     T5 Config
     """
 
-    version: Optional[str] = "google/t5-v1_1-xxl"
-    max_length: Optional[int] = 512
+    version: Optional[str] = field(default_factory=lambda: "google/t5-v1_1-xxl")
+    max_length: Optional[int] = field(default_factory=lambda: 512)
+    load_config_only: bool = False
 
 
 @dataclass
@@ -123,9 +131,9 @@ class ClipConfig:
     Clip Config
     """
 
-    version: Optional[str] = "openai/clip-vit-large-patch14"
-    max_length: Optional[int] = 77
-    always_return_pooled: Optional[bool] = True
+    version: Optional[str] = field(default_factory=lambda: "openai/clip-vit-large-patch14")
+    max_length: Optional[int] = field(default_factory=lambda: 77)
+    always_return_pooled: Optional[bool] = field(default_factory=lambda: True)
 
 
 @dataclass
@@ -134,17 +142,18 @@ class FluxModelParams:
     Flux Model Params
     """
 
-    flux_config: FluxConfig = FluxConfig()
-    vae_config: AutoEncoderConfig = AutoEncoderConfig(ch_mult=[1, 2, 4, 4], attn_resolutions=[])
-    clip_params: ClipConfig = ClipConfig()
-    t5_params: T5Config = T5Config()
+    flux_config: FluxConfig = field(default_factory=FluxConfig)
+    vae_config: AutoEncoderConfig = field(
+        default_factory=lambda: AutoEncoderConfig(ch_mult=[1, 2, 4, 4], attn_resolutions=[])
+    )
+    clip_params: ClipConfig = field(default_factory=ClipConfig)
+    t5_params: T5Config = field(default_factory=T5Config)
+
     scheduler_steps: int = 1000
     device: str = 'cuda'
 
 
 # pylint: disable=C0116
-
-
 class Flux(VisionModule):
     """
     NeMo implementation of Flux model, with flux transformer and single flux transformer blocks implemented with
@@ -234,6 +243,56 @@ class Flux(VisionModule):
                 save_converted_model_to=self.config.save_converted_model_to,
             )
 
+    def get_fp8_context(self):
+        # This is first and last 2 for mamba
+        if not self.config.fp8:
+            fp8_context = nullcontext()
+        else:
+            # To keep out TE dependency when not training in fp8
+            from transformer_engine.common.recipe import (
+                DelayedScaling,
+                Float8BlockScaling,
+                Float8CurrentScaling,
+                Format,
+                MXFP8BlockScaling,
+            )
+            from transformer_engine.pytorch import fp8_autocast
+
+            if self.config.fp8 == "e4m3":
+                fp8_format = Format.E4M3
+            elif self.config.fp8 == "hybrid":
+                fp8_format = Format.HYBRID
+            else:
+                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
+            # Defaults to delayed scaling for backward compatibility
+            if not self.config.fp8_recipe:
+                self.config.fp8_recipe = "delayed"
+
+            if self.config.fp8_recipe == "delayed":
+                fp8_recipe = DelayedScaling(
+                    margin=self.config.fp8_margin,
+                    interval=self.config.fp8_interval,
+                    fp8_format=fp8_format,
+                    amax_compute_algo=self.config.fp8_amax_compute_algo,
+                    amax_history_len=self.config.fp8_amax_history_len,
+                    override_linear_precision=(False, False, not self.config.fp8_wgrad),
+                )
+            elif self.config.fp8_recipe == "current":
+                fp8_recipe = Float8CurrentScaling(fp8_format=fp8_format)
+            elif self.config.fp8_recipe == "block":
+                fp8_recipe = Float8BlockScaling(fp8_format=fp8_format)
+            elif self.config.fp8_recipe == "mxfp8":
+                fp8_recipe = MXFP8BlockScaling(fp8_format=fp8_format)
+            else:
+                raise ValueError(f"Unsupported FP8 recipe: {self.config.fp8_recipe}")
+
+            fp8_group = None
+            if parallel_state.model_parallel_is_initialized():
+                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
+            fp8_context = fp8_autocast(enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group)
+        return fp8_context
+
     def forward(
         self,
         img: torch.Tensor,
@@ -285,37 +344,39 @@ class Flux(VisionModule):
         ids = torch.cat((txt_ids, img_ids), dim=1)
         rotary_pos_emb = self.pos_embed(ids)
         for id_block, block in enumerate(self.double_blocks):
-            hidden_states, encoder_hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                rotary_pos_emb=rotary_pos_emb,
-                emb=vec_emb,
-            )
+            with self.get_fp8_context():
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    emb=vec_emb,
+                )
 
-            if controlnet_double_block_samples is not None:
-                interval_control = len(self.double_blocks) / len(controlnet_double_block_samples)
-                interval_control = int(np.ceil(interval_control))
-                hidden_states = hidden_states + controlnet_double_block_samples[id_block // interval_control]
+                if controlnet_double_block_samples is not None:
+                    interval_control = len(self.double_blocks) / len(controlnet_double_block_samples)
+                    interval_control = int(np.ceil(interval_control))
+                    hidden_states = hidden_states + controlnet_double_block_samples[id_block // interval_control]
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=0)
 
         for id_block, block in enumerate(self.single_blocks):
-            hidden_states = block(
-                hidden_states=hidden_states,
-                rotary_pos_emb=rotary_pos_emb,
-                emb=vec_emb,
-            )
-
-            if controlnet_single_block_samples is not None:
-                interval_control = len(self.single_blocks) / len(controlnet_single_block_samples)
-                interval_control = int(np.ceil(interval_control))
-                hidden_states = torch.cat(
-                    [
-                        hidden_states[: encoder_hidden_states.shape[0]],
-                        hidden_states[encoder_hidden_states.shape[0] :]
-                        + controlnet_single_block_samples[id_block // interval_control],
-                    ]
+            with self.get_fp8_context():
+                hidden_states, _ = block(
+                    hidden_states=hidden_states,
+                    rotary_pos_emb=rotary_pos_emb,
+                    emb=vec_emb,
                 )
+
+                if controlnet_single_block_samples is not None:
+                    interval_control = len(self.single_blocks) / len(controlnet_single_block_samples)
+                    interval_control = int(np.ceil(interval_control))
+                    hidden_states = torch.cat(
+                        [
+                            hidden_states[: encoder_hidden_states.shape[0]],
+                            hidden_states[encoder_hidden_states.shape[0] :]
+                            + controlnet_single_block_samples[id_block // interval_control],
+                        ]
+                    )
 
         hidden_states = hidden_states[encoder_hidden_states.shape[0] :, ...]
 
@@ -331,14 +392,19 @@ class Flux(VisionModule):
         if load_dist_ckpt:
             from megatron.core import dist_checkpointing
 
-            sharded_state_dict = dict(state_dict=self.sharded_state_dict(prefix="module."))
+            sharded_sd_metadata = dist_checkpointing.load_content_metadata(ckpt_path)
+            if sharded_sd_metadata is None:
+                sharded_sd_metadata = {}  # backward-compatibility
+            sharded_state_dict = dict(
+                state_dict=self.sharded_state_dict(prefix="module.", metadata=sharded_sd_metadata)
+            )
             loaded_state_dict = dist_checkpointing.load(
                 sharded_state_dict=sharded_state_dict, checkpoint_dir=ckpt_path
             )
             ckpt = {k.removeprefix("module."): v for k, v in loaded_state_dict["state_dict"].items()}
         else:
             if do_convert_from_hf:
-                ckpt = flux_transformer_converter(ckpt_path, self.transformer.config)
+                ckpt = flux_transformer_converter(ckpt_path, self.config)
                 if save_converted_model_to is not None:
                     os.makedirs(save_converted_model_to, exist_ok=True)
                     save_path = os.path.join(save_converted_model_to, 'nemo_flux_transformer.safetensors')
@@ -407,6 +473,7 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         self,
         flux_params: FluxModelParams,
         optim: Optional[OptimizerModule] = None,
+        seed: int = 42,
     ):
         # pylint: disable=C0116
         self.params = flux_params
@@ -423,6 +490,11 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         self.model_type = ModelType.encoder_or_decoder
         self.text_precached = self.t5_params is None or self.clip_params is None
         self.image_precached = self.vae_config is None
+        self.seed = seed
+
+    def setup(self, stage: str):
+        super().setup(stage)
+        torch.manual_seed(self.seed + 100 * parallel_state.get_data_parallel_rank())
 
     def configure_model(self):
         # pylint: disable=C0116
@@ -450,18 +522,21 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
         # pylint: disable=C0116
         if isinstance(vae, nn.Module):
             self.vae = vae.eval().cuda()
-            self.vae_scale_factor = 2 ** (len(self.vae.params.ch_mult))
+            self.vae_scale_factor = 2 ** (len(self.vae.params.ch_mult) - 1)
+            self.vae_channels = self.vae.params.z_channels
             for param in self.vae.parameters():
                 param.requires_grad = False
         elif isinstance(vae, AutoEncoderConfig):
             self.vae = AutoEncoder(vae).eval().cuda()
-            self.vae_scale_factor = 2 ** (len(vae.ch_mult))
+            self.vae_scale_factor = 2 ** (len(vae.ch_mult) - 1)
+            self.vae_channels = vae.z_channels
             for param in self.vae.parameters():
                 param.requires_grad = False
         else:
             logging.info("Vae not provided, assuming the image input is precached...")
             self.vae = None
-            self.vae_scale_factor = 16
+            self.vae_scale_factor = 8
+            self.vae_channels = 16
 
     def configure_text_encoders(self, clip, t5):
         # pylint: disable=C0116
@@ -482,7 +557,10 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
             self.t5 = t5
         elif isinstance(t5, T5Config):
             self.t5 = FrozenT5Embedder(
-                self.t5_params.version, max_length=self.t5_params.max_length, device=torch.cuda.current_device()
+                self.t5_params.version,
+                max_length=self.t5_params.max_length,
+                device=torch.cuda.current_device(),
+                load_config_only=self.t5_params.load_config_only,
             )
         else:
             logging.info("T5 encoder not provided, assuming the text embeddings is precached...")
@@ -545,15 +623,14 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
                 guidance=guidance_vec,
             )
 
-        noise_pred = self._unpack_latents(
-            noise_pred.transpose(0, 1),
-            int(latents.shape[2] * self.vae_scale_factor // 2),
-            int(latents.shape[3] * self.vae_scale_factor // 2),
-            vae_scale_factor=self.vae_scale_factor,
-        ).transpose(0, 1)
+            noise_pred = self._unpack_latents(
+                noise_pred.transpose(0, 1),
+                latents.shape[2],
+                latents.shape[3],
+            ).transpose(0, 1)
 
-        target = noise - latents
-        loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+            target = noise - latents
+            loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
         return loss
 
     def encode_prompt(self, prompt, device='cuda', dtype=torch.float32):
@@ -646,20 +723,19 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
             timesteps,
         )
 
-    def _unpack_latents(self, latents, height, width, vae_scale_factor):
+    def _unpack_latents(self, latents, height, width):
         # pylint: disable=C0116
         batch_size, num_patches, channels = latents.shape
 
-        height = height // vae_scale_factor
-        width = width // vae_scale_factor
-
-        latents = latents.view(batch_size, height, width, channels // 4, 2, 2)
+        # adjust h and w for patching
+        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
 
-        latents = latents.reshape(batch_size, channels // (2 * 2), height * 2, width * 2)
+        latents = latents.reshape(batch_size, channels // 4, height, width)
 
         return latents
 
+    @lru_cache
     def _prepare_latent_image_ids(
         self, batch_size: int, height: int, width: int, device: torch.device, dtype: torch.dtype
     ):
@@ -675,7 +751,7 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
             batch_size, latent_image_id_height * latent_image_id_width, latent_image_id_channels
         )
 
-        return latent_image_ids.to(device=device, dtype=dtype)
+        return latent_image_ids.to(device=device, dtype=dtype, non_blocking=True)
 
     def _pack_latents(self, latents, batch_size, num_channels_latents, height, width):
         # pylint: disable=C0116
@@ -708,7 +784,7 @@ class MegatronFluxModel(L.LightningModule, io.IOMixin, io.ConnectorMixin, fn.FNM
 
 
 @io.model_importer(MegatronFluxModel, "hf")
-class HFFluxImporter(io.ModelConnector["black-forest-labs/FLUX.1-dev", MegatronFluxModel]):
+class HFFluxImporter(io.ModelConnector["FluxTransformer2DModel", MegatronFluxModel]):
     '''
     Convert a HF ckpt into NeMo dist-ckpt compatible format.
     '''
@@ -718,6 +794,7 @@ class HFFluxImporter(io.ModelConnector["black-forest-labs/FLUX.1-dev", MegatronF
         return MegatronFluxModel(self.config)
 
     def apply(self, output_path: Path) -> Path:
+        from diffusers import FluxTransformer2DModel
 
         source = FluxTransformer2DModel.from_pretrained(str(self), subfolder="transformer")
         target = self.init()
@@ -735,6 +812,8 @@ class HFFluxImporter(io.ModelConnector["black-forest-labs/FLUX.1-dev", MegatronF
 
     @property
     def config(self) -> FluxConfig:
+        from diffusers import FluxTransformer2DModel
+
         source = FluxTransformer2DModel.from_pretrained(str(self), subfolder="transformer")
         source_config = source.config
         flux_config = FluxConfig(

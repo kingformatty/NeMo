@@ -28,10 +28,8 @@ from nemo.collections.common.tokenizers.text_to_speech.tokenizer_utils import (
 from nemo.collections.tts.g2p.models.base import BaseG2p
 from nemo.collections.tts.g2p.utils import GRAPHEME_CASE_MIXED, GRAPHEME_CASE_UPPER, set_grapheme_case
 from nemo.utils import logging
-from nemo.utils.decorators import experimental
 
 
-@experimental
 class IpaG2p(BaseG2p):
     # fmt: off
     STRESS_SYMBOLS = ["ˈ", "ˌ"]
@@ -227,7 +225,7 @@ class IpaG2p(BaseG2p):
 
     @staticmethod
     def _parse_file_by_lines(p: Union[str, pathlib.Path]) -> List[str]:
-        with open(p, 'r') as f:
+        with open(p, 'r', encoding='utf-8') as f:
             return [line.rstrip() for line in f.readlines()]
 
     def _prepend_prefix_for_one_word(self, word: str) -> List[str]:
@@ -344,8 +342,7 @@ class IpaG2p(BaseG2p):
         return len(self.phoneme_dict[word]) == 1
 
     def parse_one_word(self, word: str) -> Tuple[List[str], bool]:
-        """Returns parsed `word` and `status` (bool: False if word wasn't handled, True otherwise).
-        """
+        """Returns parsed `word` and `status` (bool: False if word wasn't handled, True otherwise)."""
         word = set_grapheme_case(word, case=self.grapheme_case)
 
         # Punctuation (assumes other chars have been stripped)
@@ -451,12 +448,6 @@ class IpaG2p(BaseG2p):
 
     def __call__(self, text: str) -> List[str]:
         text = normalize_unicode_text(text)
-
-        if self.heteronym_model is not None:
-            try:
-                text = self.heteronym_model.disambiguate(sentences=[text])[1][0]
-            except Exception as e:
-                logging.warning(f"Heteronym model failed {e}, skipping")
 
         words_list_of_tuple = self.word_tokenize_func(text)
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,17 +16,21 @@ import random
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Optional, Sequence, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
+import lhotse
 import numpy as np
 import torch
 from lhotse import CutSet, RecordingSet
 from lhotse.cut import Cut
 from lhotse.dataset import (
+    ClippingTransform,
+    Compress,
     CutConcatenate,
     DynamicBucketingSampler,
     DynamicCutSampler,
     IterableDatasetWrapper,
+    LowpassUsingResampling,
     ReverbWithImpulseResponse,
     RoundRobinSampler,
     ZipSampler,
@@ -45,6 +49,8 @@ from nemo.collections.common.data.lhotse.cutset import (
 )
 from nemo.collections.common.data.lhotse.sampling import (
     BucketingFilter,
+    CERFilter,
+    ContextSpeakerSimilarityFilter,
     DurationFilter,
     FixedBucketBatchSizeConstraint2D,
     MultimodalFixedBucketBatchSizeConstraint2D,
@@ -52,6 +58,7 @@ from nemo.collections.common.data.lhotse.sampling import (
     TokenCountFilter,
     TokenPerSecondFilter,
     TokenPerTokenFilter,
+    ValidationStatusFilter,
 )
 from nemo.collections.common.data.prompt_fn import apply_prompt_format_fn
 from nemo.collections.common.prompts import PromptFormatter
@@ -111,6 +118,7 @@ class LhotseDataLoadingConfig:
     pretokenize: bool = True  # should we apply tokenizer before data sampling
     prompt_format: str | None = None  # when provided, we'll apply the prompt in addition to the tokenizer
     use_multimodal_sampling: bool = False
+    audio_locator_tag: str | None = None  # global audio placeholder token, propagates to datasets in input_cfg
     token_equivalent_duration: float | None = None
     batch_tokens: int | None = None
     quadratic_factor: float | None = None
@@ -129,6 +137,13 @@ class LhotseDataLoadingConfig:
     measure_total_length: bool = True
     min_tpt: int = -1  # allowed tokens per token (text-only)
     max_tpt: Any = float("inf")  # float | list[float]
+
+    # 2.3 Filters on CER and/or cosine speaker similarity of the context audio serving for TTS use cases.
+    max_cer: float | None = float("inf")
+    min_context_speaker_similarity: float | None = -1
+
+    # 2.4 Filters on validation status. If the validation status is not "pass", the cut will be filtered out.
+    keep: str = "pass"
 
     # 3. Supported existing NeMo options.
     shuffle: bool = False
@@ -175,6 +190,27 @@ class LhotseDataLoadingConfig:
     #   f. Padding to a minimum duration. Examples shorter than this will be padded, others are unaffected.
     pad_min_duration: Optional[float] = None
     pad_direction: str = "right"  # "right" | "left" | "both" | "random"
+    #   g. Bandwidth limitation via back-and-forth resampling
+    lowpass_enabled: bool = False
+    lowpass_frequencies_interval: Tuple[float, float] = (3500.0, 8000.0)
+    lowpass_prob: float = 0.5
+    #   h. Lossy compression augmentation (opus, mp3, vorbis, gsm)
+    #   implemented via soundfile, so compression level is specified via number in [0.0, 1.0]
+    #   0.0 denotes the highest bitrate and denotes the lowest bitrate for a given codec
+    #   overall, parameters mirror lhotse interface
+    compression_enabled: bool = False
+    compression_prob: float = 0.5
+    compression_level_interval: Tuple[float, float] = (0.8, 0.99)
+    compression_codecs: Tuple[str] = ("opus",)
+    compression_codec_weights: Optional[List[float]] = None
+    compression_enable_for_custom_fields: bool = False
+    #   i. Clipping/saturation augmentation
+    clipping_enabled: bool = False
+    clipping_gain_db: Tuple[float, float] = (0.0, 24.0)
+    clipping_normalize: bool = True
+    clipping_oversampling: Optional[int] = 2
+    clipping_prob_hard: float = 0.5
+    clipping_prob: float = 0.5
 
     # 5. Other Lhotse options.
     text_field: str = "text"  # key to read the transcript from
@@ -202,6 +238,14 @@ class LhotseDataLoadingConfig:
     # * use map dataset for non-tarred audio data (we might change this in the future)
     force_map_dataset: bool = False
     force_iterable_dataset: bool = False
+    # Force the dataloader to slice each data source.
+    # This may improve sampling randomness for large-scale runs with many dataset sources and large shards
+    # at the cost of some IO redundancy.
+    # The slicing is achieved with a randomly-selected offset K used to skip the first K examples,
+    # and reading them consecutively for ``slice_length`` iterations.
+    # The first K examples will actually be read and then discarded, incurring the IO cost, due to
+    # our support of object stores and gzipped files that generally don't have indexes of byte offsets per line.
+    slice_length: Optional[int] = None
 
 
 def determine_use_iterable_dataset(use_iterable_dataset: bool, config: DictConfig) -> bool:
@@ -221,7 +265,7 @@ def get_lhotse_dataloader_from_config(
     tokenizer=None,
 ) -> torch.utils.data.DataLoader:
     """
-    Set up a Lhotse training dataloder.
+    Set up a Lhotse training dataloader.
 
     Expects a typical NeMo dataset configuration format, with additional fields: "use_lhotse=True".
     Some fields in the original NeMo configuration may be ignored.
@@ -267,7 +311,7 @@ def get_lhotse_dataloader_from_single_config(
     tokenizer=None,
 ) -> torch.utils.data.DataLoader:
     """
-    Set up a Lhotse training dataloder.
+    Set up a Lhotse training dataloader.
 
     Expects a typical NeMo dataset configuration format, with additional fields: "use_lhotse=True".
     Some fields in the original NeMo configuration may be ignored.
@@ -463,7 +507,7 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
         cuts = cuts.map(partial(_select_channel, channel_selector=config.channel_selector))
 
     # Resample as a safeguard; it's a no-op when SR is already OK
-    cuts = cuts.resample(config.sample_rate)
+    cuts = cuts.map(partial(resample, sampling_rate=config.sample_rate), apply_fn=None)
 
     # Expands cuts if multiple translations are provided.
     cuts = CutSet(LazyFlattener(cuts.map(_flatten_alt_text, apply_fn=None)))
@@ -492,8 +536,6 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
             if not isinstance(tokenizer, TokenizerWrapper):
                 tokenizer = TokenizerWrapper(tokenizer)
             cuts = cuts.map(partial(tokenize, tokenizer=tokenizer), apply_fn=None)
-        cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))
-        cuts = cuts.filter(TokenPerTokenFilter(config.min_tpt, config.max_tpt))
 
     # 2. Optional augmentations.
     # 2.a. Noise mixing.
@@ -541,6 +583,17 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     cuts = cuts.filter(
         TokenCountFilter(config.min_tokens, config.max_tokens, measure_total_length=config.measure_total_length)
     )
+
+    # validation status filtering
+    cuts = cuts.filter(ValidationStatusFilter(config.keep))
+    # CER filtering, same as native NeMo dataloaders.
+    cuts = cuts.filter(CERFilter(config.max_cer))
+    # Context speaker similarity filtering, same as native NeMo dataloaders.
+    cuts = cuts.filter(ContextSpeakerSimilarityFilter(config.min_context_speaker_similarity))
+
+    if tokenizer is not None and config.pretokenize:
+        cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))
+        cuts = cuts.filter(TokenPerTokenFilter(config.min_tpt, config.max_tpt))
 
     # Select the strategy customizing Lhotse sampler behaviour.
     # Provides support for dynamic batch sizes, multimodal dataloading, 2D bucketing, etc.
@@ -611,12 +664,53 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
         if config.concatenate_merge_supervisions:
             sampler = sampler.map(_merge_supervisions)
 
+    if config.lowpass_enabled:
+        if lhotse.get_current_resampling_backend() != "libsox":
+            logging.warning(
+                "Lowpass augmentation works best with libsox backend. Consider setting resamping backend in Lhotse to libsox."
+            )
+        sampler = sampler.map(
+            LowpassUsingResampling(
+                frequencies_interval=OmegaConf.to_container(config.lowpass_frequencies_interval),
+                p=config.lowpass_prob,
+                seed=config.shard_seed,
+            )
+        )
+
+    if config.clipping_enabled:
+        sampler = sampler.map(
+            ClippingTransform(
+                gain_db=OmegaConf.to_container(config.clipping_gain_db),
+                normalize=config.clipping_normalize,
+                p=config.clipping_prob,
+                p_hard=config.clipping_prob_hard,
+                oversampling=config.clipping_oversampling,
+                seed=config.shard_seed,
+            )
+        )
+
     if config.rir_enabled:
         sampler = sampler.map(
             ReverbWithImpulseResponse(
                 rir_recordings=RecordingSet.from_file(config.rir_path) if config.rir_path is not None else None,
                 p=config.rir_prob,
                 randgen=random.Random(config.seed),
+            )
+        )
+
+    if config.compression_enabled:
+        sampler = sampler.map(
+            Compress(
+                codecs=OmegaConf.to_container(config.compression_codecs),
+                p=config.compression_prob,
+                compression_level=OmegaConf.to_container(config.compression_level_interval),
+                codec_weights=(
+                    OmegaConf.to_container(config.compression_codec_weights)
+                    if config.compression_codec_weights
+                    else config.compression_codec_weights
+                ),
+                compress_custom_fields=config.compression_enable_for_custom_fields,
+                seed=config.shard_seed,
             )
         )
 
@@ -646,6 +740,7 @@ def determine_sampling_constraint(cuts: CutSet, bucket_duration_bins, config) ->
                 token_equivalent_duration=config.token_equivalent_duration,
                 strict_2d=config.bucketing_2d_strict_mode,
                 max_ratio=config.max_tpt if isinstance(config.max_tpt, Sequence) else None,
+                measure_total_length=config.measure_total_length,
             )
             cuts = cuts.filter(BucketingFilter(constraint))
         else:
@@ -654,6 +749,7 @@ def determine_sampling_constraint(cuts: CutSet, bucket_duration_bins, config) ->
                 batch_size=config.batch_size,
                 batch_tokens=config.batch_tokens,
                 quadratic_factor=config.quadratic_factor,
+                measure_total_length=config.measure_total_length,
             )
     else:
         if config.bucket_batch_size is not None:
@@ -832,6 +928,20 @@ def maybe_set_cuda_expandable_segments(enabled: bool):
                 "Failed to set expandable_segments:True for PyTorch CUDA allocator. "
                 "You may get training speed improvements if you enable this "
             )
+
+
+def resample(example, sampling_rate):
+    from nemo.collections.common.data.lhotse.text_adapters import NeMoMultimodalConversation
+
+    if isinstance(example, Cut):
+        return example.resample(sampling_rate)
+    elif isinstance(example, NeMoMultimodalConversation):
+        for turn in example.turns:
+            if hasattr(turn, "cut"):
+                turn.cut = turn.cut.resample(sampling_rate)
+        return example
+    else:
+        return example
 
 
 def _select_channel(cut, channel_selector: int | str) -> list:

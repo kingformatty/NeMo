@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,11 +26,11 @@ from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADER
 from torch.utils import data
 from torch.utils.data import DataLoader, default_collate
 
-from nemo.collections.nlp.modules.common.megatron.utils import get_ltor_masks_and_position_ids
 from nemo.collections.vlm.mllama.model.utils import create_vision_mask_tensor
 from nemo.collections.vlm.neva.data.config import DataConfig, ImageDataConfig
 from nemo.collections.vlm.neva.data.preloaded import IGNORE_INDEX, LazySupervisedDataset
 from nemo.lightning.pytorch.plugins import MegatronDataSampler
+from nemo.utils.megatron_utils import get_ltor_masks_and_position_ids
 
 
 class MLlamaDataset(LazySupervisedDataset):
@@ -46,10 +46,10 @@ class MLlamaDataset(LazySupervisedDataset):
     ):
 
         if data_path.endswith(".json"):
-            super().__init__(data_path, data_config, tokenizer, image_processor, sequence_length)
+            super().__init__(data_path, data_config, tokenizer, image_processor)
 
         elif data_path.endswith(".jsonl"):
-            super().__init__(None, data_config, tokenizer, image_processor, sequence_length)
+            super().__init__(None, data_config, tokenizer, image_processor)
             logging.warning("Loading image inputs from SteerLM Dataset...")
             if data_config.media_type == 'image':
                 image_folder = data_config.image_folder
@@ -76,6 +76,7 @@ class MLlamaDataset(LazySupervisedDataset):
 
         else:
             raise ValueError(f"Formatting of {data_path} is not supported in MLlama.")
+        self.sequence_length = sequence_length
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         source = self.list_data_dict[i]

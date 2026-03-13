@@ -167,8 +167,8 @@ def cal_write_wer(
     punctuations: Optional[list] = None,
     strip_punc_space: bool = False,
 ) -> Tuple[str, dict, str]:
-    """ 
-    Calculate wer, inserion, deletion and substitution rate based on groundtruth text and pred_text_attr_name (pred_text) 
+    """
+    Calculate wer, inserion, deletion and substitution rate based on groundtruth text and pred_text_attr_name (pred_text)
     We use WER in function name as a convention, but Error Rate (ER) currently support Word Error Rate (WER) and Character Error Rate (CER)
     """
     samples = []
@@ -177,7 +177,10 @@ def cal_write_wer(
     eval_metric = "cer" if use_cer else "wer"
 
     with open(pred_manifest, 'r') as fp:
-        for line in fp:
+        for line in fp.readlines():
+            line = line.strip()
+            if not line:
+                continue
             sample = json.loads(line)
 
             if gt_text_attr_name not in sample:
@@ -266,7 +269,10 @@ def cal_write_text_metric(
 
     metric_calculator = TEXT_METRICS_MAPPING[metric](**metric_args) if metric_args else TEXT_METRICS_MAPPING[metric]()
     with open(pred_manifest, 'r') as fp:
-        for line in fp:
+        for line in fp.readlines():
+            line = line.strip()
+            if not line:
+                continue
             sample = json.loads(line)
 
             if gt_text_attr_name not in sample:
@@ -322,3 +328,18 @@ def cal_write_text_metric(
         metric: total_score,
     }
     return output_manifest_w_wer, total_res, metric
+
+
+def compute_laal(delays, source_length, target_length):
+    if delays[0] > source_length:
+        return delays[0]
+    LAAL = 0
+    gamma = max(len(delays), target_length) / source_length
+    tau = 0
+    for t_minus_1, d in enumerate(delays):
+        LAAL += d - t_minus_1 / gamma
+        tau = t_minus_1 + 1
+        if d >= source_length:
+            break
+    LAAL /= tau
+    return LAAL

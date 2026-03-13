@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@ import functools
 import json
 import logging
 import os
-import pickle
 import shutil
 from io import BytesIO
 from pathlib import Path
@@ -52,19 +51,7 @@ def load_extra_state_from_bytes(val: Optional[Union[torch.Tensor, BytesIO]]) -> 
     Returns:
         Optional[dict]: Deserialized extra_state, or None if the bytes storage is empty.
     """
-    if val is None:
-        return None
-
-    # TransformerEngine shifted from storing extra_states bytes storage from _io.BytesIO to torch.Tensor
-    if isinstance(val, torch.Tensor):
-        if val.numel() == 0:
-            return None
-
-        val = val.detach().numpy(force=True).tobytes()
-        return pickle.loads(val)
-
-    val.seek(0)
-    return torch.load(val, weights_only=True)
+    raise Exception("nemo.export is deprecated. Please use the repo https://github.com/NVIDIA-NeMo/Export-Deploy.")
 
 
 def preprocess_scaling_factors_for_local_export(state_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -273,14 +260,13 @@ def get_tokenizer(tokenizer_dir_or_path: Union[str, Path]) -> PreTrainedTokenize
     tokenizer_dir_or_path = Path(tokenizer_dir_or_path)
     if (tokenizer_dir_or_path / "nemo_context").exists():
         return get_tokenizer_from_nemo2_context(tokenizer_dir_or_path / "nemo_context")
+    elif (tokenizer_dir_or_path / "tokenizer_config.json").exists():
+        return AutoTokenizer.from_pretrained(tokenizer_dir_or_path)
     elif os.path.exists(os.path.join(tokenizer_dir_or_path, "vocab.json")):
         vocab_path = tokenizer_dir_or_path / "vocab.json" if tokenizer_dir_or_path.is_dir() else tokenizer_dir_or_path
         tokenizer_config = {"library": "tiktoken", "vocab_file": str(vocab_path)}
         return build_tokenizer(tokenizer_config)
     else:
-        if (tokenizer_dir_or_path / "huggingface_tokenizer").is_dir():
-            return AutoTokenizer.from_pretrained(tokenizer_dir_or_path / "huggingface_tokenizer")
-
         model_path = (
             tokenizer_dir_or_path / "tokenizer.model" if tokenizer_dir_or_path.is_dir() else tokenizer_dir_or_path
         )

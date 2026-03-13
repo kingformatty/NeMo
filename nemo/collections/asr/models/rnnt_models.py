@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+from hydra.utils import instantiate
 from lightning.pytorch import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
@@ -41,7 +42,7 @@ from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
 from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.parts.utils.transcribe_utils import process_timestamp_outputs
+from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_outputs
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.parts.preprocessing.parsers import make_parser
 from nemo.core.classes.common import PretrainedModelInfo, typecheck
@@ -78,6 +79,17 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
 
         self.decoder = EncDecRNNTModel.from_config_dict(self.cfg.decoder)
         self.joint = EncDecRNNTModel.from_config_dict(self.cfg.joint)
+        # Optional adapter after encoder, before decoder/joint (e.g. LinearAdapter for domain adaptation)
+        self.encoder_output_adapter = None
+        if hasattr(self.cfg, 'encoder_output_adapter') and self.cfg.encoder_output_adapter is not None:
+            adapter_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg.encoder_output_adapter, resolve=False))
+            with open_dict(adapter_cfg):
+                adapter_cfg.in_features = self.cfg.model_defaults.enc_hidden
+            self.encoder_output_adapter = instantiate(adapter_cfg)
+            logging.info(
+                f"Added encoder-output adapter (before decoder): {self.encoder_output_adapter.__class__.__name__} "
+                f"(in_features={self.cfg.model_defaults.enc_hidden})"
+            )
 
         # Setup RNNT Loss
         loss_name, loss_kwargs = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
@@ -285,6 +297,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             * A list of greedy transcript texts / Hypothesis
             * An optional list of beam search transcript texts / Hypothesis / NBestHypothesis.
         """
+
         timestamps = timestamps or (override_config.timestamps if override_config is not None else None)
         if timestamps is not None:
             if timestamps or (override_config is not None and override_config.timestamps):
@@ -296,13 +309,13 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
                 with open_dict(self.cfg.decoding):
                     self.cfg.decoding.compute_timestamps = True
                     self.cfg.decoding.preserve_alignments = True
-                self.change_decoding_strategy(self.cfg.decoding, verbose=False)
             else:
                 return_hypotheses = False
                 with open_dict(self.cfg.decoding):
                     self.cfg.decoding.compute_timestamps = False
                     self.cfg.decoding.preserve_alignments = False
-                self.change_decoding_strategy(self.cfg.decoding, verbose=False)
+
+            self.change_decoding_strategy(self.cfg.decoding, verbose=False)
 
         return super().transcribe(
             audio=audio,
@@ -703,6 +716,14 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
 
         encoded, encoded_len = self.encoder(audio_signal=processed_signal, length=processed_signal_length)
+
+        # Apply optional adapter after encoder (before decoder/joint)
+        # Encoder output is (B, D, T); LinearAdapter expects feature dim last (B, T, D)
+        if self.encoder_output_adapter is not None:
+            encoded = encoded.transpose(1, 2)  # (B, D, T) -> (B, T, D)
+            encoded = encoded + self.encoder_output_adapter(encoded)
+            encoded = encoded.transpose(1, 2)  # (B, T, D) -> (B, D, T)
+
         return encoded, encoded_len
 
     # PTL-specific methods
@@ -815,7 +836,7 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
         del signal
 
         best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
+            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
         )
 
         if isinstance(sample_id, torch.Tensor):

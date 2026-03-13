@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ class TokenizerWrapper:
 
     def detokenize(self, tokens):
         # pylint: disable=C0115,C0116
-        return self._tokenizer.decode(tokens, skip_special_tokens=True)
+        return self._tokenizer.decode(tokens, skip_special_tokens=False)
 
     def tokenize(self, prompt):
         # pylint: disable=C0115,C0116
@@ -62,18 +62,64 @@ class VLMTextGenerationController(SimpleTextGenerationController):
             }
         return tokens, image_dict
 
-    def prep_model_for_inference(
-        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[int, InferenceRequest]
+    def prep_inference_input(
+        self,
+        prompts_tokens: torch.Tensor,
+        active_requests: OrderedDict[str, InferenceRequest],
+        use_attention_mask: bool = False,
     ):
-        """Preparing batch for inference, using respective wrapper's prep_model_for_inference method
+        """Preparing input data for inference, using respective wrapper's prep_inference_input method
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
             active_requests (OrderedDict[int, InferenceRequest]): The input active requests
+            use_attention_mask (bool): Whether to use an attention mask. Should be set to True only
+                when exclusively doing prefill (no decode) with variable prompt lengths.
+                Currently unused and added to match an expected interface in Mcore.
         """
         images = list(map(lambda request: request.encoder_prompt, active_requests.values()))
 
-        self.inference_wrapped_model.prep_model_for_inference(
+        return self.inference_wrapped_model.prep_inference_input(
             prompts_tokens=prompts_tokens,
             image_dict=images,
         )
+
+
+class QwenVLTextGenerationController(VLMTextGenerationController):
+    """Text generation controller for QwenVL model"""
+
+    def __init__(self, inference_wrapped_model, tokenizer, image_processor, processor):
+        super().__init__(inference_wrapped_model, tokenizer, image_processor)
+
+        class QwenVLTokenizer(TokenizerWrapper):
+            # pylint: disable=C0115,C0116
+            def detokenize(self, tokens):
+                new_tokens = []
+                for token in tokens:
+                    if token == 151652:
+                        new_tokens.append(token)
+                        new_tokens.append(151655)
+                    elif token != -200:
+                        new_tokens.append(token)
+                return self._tokenizer.decode(new_tokens, skip_special_tokens=False)
+
+        self.tokenizer = QwenVLTokenizer(tokenizer)
+        self.processor = processor
+
+    def tokenize_prompt(self, prompt: str, image):
+        """Tokenize prompt and process image following the VLM controller API"""
+        inputs = self.processor(
+            text=[prompt],
+            images=image,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        tokens = inputs['input_ids'][0]
+        tokens[tokens == 151655] = -200
+
+        image_dict = {
+            'pixel_values': inputs['pixel_values'],
+            'image_grid_thw': inputs['image_grid_thw'],
+        }
+        return tokens.tolist(), image_dict

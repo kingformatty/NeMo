@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union
 
 import fiddle as fdl
 import fiddle._src.experimental.dataclasses as fdl_dc
+import lightning.pytorch as pl
 from cloudpickle import dump
 from cloudpickle import load as pickle_load
 from fiddle._src import config as config_lib
@@ -188,6 +189,13 @@ class IOMixin:
 
     def __init_subclass__(cls):
         _io_register_serialization(cls)
+
+        # Add OneLogger timing hooks for data modules to enable telemetry tracking
+        if issubclass(cls, pl.LightningDataModule):
+            from nemo.lightning.callback_group import hook_class_init_with_callbacks
+
+            hook_class_init_with_callbacks(cls, "on_dataloader_init_start", "on_dataloader_init_end")
+        super().__init_subclass__()
 
     def io_transform_args(self, init_fn, *args, **kwargs) -> Dict[str, Any]:
         """
@@ -665,9 +673,10 @@ def _artifact_transform_save(instance, cfg: fdl.Config, output_path: Path, relat
 
     for attr in dir(cfg):
         try:
-            child = to_config(getattr(cfg, attr))
+            child = getattr(cfg, attr)
         except AttributeError:
             continue
+        child = to_config(child)
         try:
             if isinstance(child, (fdl.Config, fdl.Partial)):
                 setattr(

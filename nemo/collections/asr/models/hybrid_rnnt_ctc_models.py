@@ -23,18 +23,18 @@ from nemo.collections.asr.data.audio_to_text_dali import DALIOutputs
 from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
-from nemo.collections.asr.parts.mixins import ASRBPEMixin, InterCTCMixin, TranscribeConfig
+from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRTranscriptionMixin, InterCTCMixin, TranscribeConfig
 from nemo.collections.asr.parts.mixins.transcription import TranscriptionReturnType
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
-from nemo.collections.asr.parts.utils.transcribe_utils import process_timestamp_outputs
+from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_outputs
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import AccessMixin
 from nemo.utils import logging, model_utils
 
 
-class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
+class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin, ASRTranscriptionMixin):
     """Base class for hybrid RNNT/CTC models."""
 
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
@@ -102,7 +102,7 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         channel_selector: Optional[ChannelSelectorType] = None,
         augmentor: DictConfig = None,
         verbose: bool = True,
-        timestamps: bool = False,
+        timestamps: bool = None,
         override_config: Optional[TranscribeConfig] = None,
     ) -> TranscriptionReturnType:
         """
@@ -141,23 +141,29 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
                     f"{self.cur_decoder} is not supported for cur_decoder. Supported values are ['ctc', 'rnnt']"
                 )
             decoding_cfg = self.cfg.aux_ctc.decoding if self.cur_decoder == "ctc" else self.cfg.decoding
+            need_change_decoding = False
             if timestamps or (override_config is not None and override_config.timestamps):
                 logging.info(
                     "Timestamps requested, setting decoding timestamps to True. Capture them in Hypothesis object, \
                         with output[idx].timestep['word'/'segment'/'char']"
                 )
                 return_hypotheses = True
-                with open_dict(decoding_cfg):
-                    decoding_cfg.compute_timestamps = True
-                    decoding_cfg.preserve_alignments = True
-                self.change_decoding_strategy(decoding_cfg, decoder_type=self.cur_decoder, verbose=False)
+                if decoding_cfg.get("compute_timestamps", None) is not True:
+                    # compute_timestamps None, False or non-existent -> change to True
+                    need_change_decoding = True
+                    with open_dict(decoding_cfg):
+                        decoding_cfg.compute_timestamps = True
             else:
-                with open_dict(decoding_cfg):
-                    decoding_cfg.compute_timestamps = False
-                    decoding_cfg.preserve_alignments = False
+                if decoding_cfg.get("compute_timestamps", None) is not False:
+                    # compute_timestamps None, True or non-existent -> change to False
+                    need_change_decoding = True
+                    with open_dict(decoding_cfg):
+                        decoding_cfg.compute_timestamps = False
+            if need_change_decoding:
                 self.change_decoding_strategy(decoding_cfg, decoder_type=self.cur_decoder, verbose=False)
 
-        return super().transcribe(
+        return ASRTranscriptionMixin.transcribe(
+            self,
             audio=audio,
             batch_size=batch_size,
             return_hypotheses=return_hypotheses,
@@ -490,7 +496,6 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
         return {'loss': loss_value}
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        # TODO: add support for CTC decoding
         signal, signal_len, transcript, transcript_len, sample_id = batch
 
         # forward() only performs encoder forward
@@ -500,12 +505,21 @@ class EncDecHybridRNNTCTCModel(EncDecRNNTModel, ASRBPEMixin, InterCTCMixin):
             encoded, encoded_len = self.forward(input_signal=signal, input_signal_length=signal_len)
         del signal
 
-        best_hyp_text = self.decoding.rnnt_decoder_predictions_tensor(
-            encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=False
-        )
+        if self.cur_decoder == 'rnnt':
+            best_hyp = self.decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoded, encoded_lengths=encoded_len, return_hypotheses=True
+            )
+        else:
+            logits = self.ctc_decoder(encoder_output=encoded)
+            best_hyp = self.ctc_decoding.ctc_decoder_predictions_tensor(
+                decoder_outputs=logits,
+                decoder_lengths=encoded_len,
+                return_hypotheses=True,
+            )
+
         if isinstance(sample_id, torch.Tensor):
             sample_id = sample_id.cpu().detach().numpy()
-        return list(zip(sample_id, best_hyp_text))
+        return list(zip(sample_id, best_hyp))
 
     def validation_pass(self, batch, batch_idx, dataloader_idx):
         if self.is_interctc_enabled():

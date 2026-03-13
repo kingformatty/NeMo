@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # pylint: disable=C0116
-import bisect
-import logging
 import math
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
-from lhotse.cut import Cut
+from lhotse.cut import Cut, MonoCut
 from lhotse.dataset import SamplingConstraint, TokenConstraint
 from lhotse.dataset.sampling.dynamic_bucketing import FixedBucketBatchSizeConstraint
 from lhotse.utils import ifnone
 
-from nemo.collections.common.data.lhotse.text_adapters import Formattable
+from nemo.collections.common.data.lhotse.text_adapters import Formattable, NeMoMultimodalConversation
 
 
 @dataclass
@@ -261,8 +259,73 @@ class DurationFilter:
     def __call__(self, example) -> bool:
         if isinstance(example, Cut):
             return self.d_min <= example.duration <= self.d_max
+        elif isinstance(example, NeMoMultimodalConversation):
+            if example.is_text_only:
+                return True  # does not apply to text
+            tot_dur = sum(c.duration for c in example.list_cuts())
+            return self.d_min <= tot_dur <= self.d_max
         else:
             return True  # does not apply to text etc.
+
+
+class ValidationStatusFilter:
+    """
+    Callable, returns ``True`` if a cut's validation status is equal to keep and ``False`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, keep: str = "pass") -> None:
+        self.keep = keep
+
+    def __call__(self, example) -> bool:
+        if (
+            isinstance(example, MonoCut)
+            and example.has_custom("validation_status")
+            and example.validation_status != self.keep
+        ):
+            return False
+        else:
+            return True
+
+
+class CERFilter:
+    """
+    Callable, returns ``True`` if a cut's CER is less than max_cer and ``False`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, max_cer: float | None) -> None:
+        self.max_cer = ifnone(max_cer, float("inf"))
+
+    def __call__(self, example) -> bool:
+        if (
+            isinstance(example, MonoCut)
+            and len(example.supervisions) > 0
+            and example.supervisions[0].has_custom("cer")
+        ):
+            return example.supervisions[0].cer <= self.max_cer
+        else:
+            return True
+
+
+class ContextSpeakerSimilarityFilter:
+    """
+    Callable, returns ``True`` if a cut's context speaker similarity is greater than min_context_speaker_similarity and ``False`` otherwise.
+    Acts as a pass-through for objects of other type than Cut.
+    """
+
+    def __init__(self, min_context_speaker_similarity: float | None) -> None:
+        self.min_context_speaker_similarity = ifnone(min_context_speaker_similarity, -1)
+
+    def __call__(self, example) -> bool:
+        if (
+            isinstance(example, MonoCut)
+            and len(example.supervisions) > 0
+            and example.supervisions[0].has_custom("context_speaker_similarity")
+        ):
+            return example.supervisions[0].context_speaker_similarity >= self.min_context_speaker_similarity
+        else:
+            return True
 
 
 class TokenCountFilter:

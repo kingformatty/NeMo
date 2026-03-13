@@ -28,6 +28,7 @@ __all__ = [
     "TopKSequenceGenerator",
     "BeamSearchSequenceGenerator",
     "BeamSearchSequenceGeneratorWithLanguageModel",
+    "BeamSearchSequenceGeneratorWithNGramLM",
     "EnsembleBeamSearchSequenceGenerator",
 ]
 
@@ -140,14 +141,14 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
             encoder_input_mask: input mask used in the encoder
             decoder_mems_list: list of size num_layers with cached activations
                 of sequence (x[1], ..., x[k-1]) for fast generation of x[k]
-            pos: starting position in positional encoding
+            pos: starting position in positional encoding (can be a tensor for asynchronius decoding)
         """
 
         decoder_hidden_states = self.embedding.forward(decoder_input_ids, start_pos=pos)
         decoder_input_mask = mask_padded_tokens(decoder_input_ids, self.pad).float()
 
         if encoder_hidden_states is not None:
-            decoder_mems_list = self.decoder.forward(
+            decoder_mems_list, xatt_scores_list = self.decoder.forward(
                 decoder_hidden_states,
                 decoder_input_mask,
                 encoder_hidden_states,
@@ -156,12 +157,14 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
                 return_mems=True,
             )
         else:
-            decoder_mems_list = self.decoder.forward(
+            decoder_mems_list, _ = self.decoder.forward(
                 decoder_hidden_states, decoder_input_mask, decoder_mems_list, return_mems=True
             )
+            xatt_scores_list = None
         with self.classifier.with_log_softmax_enabled(return_scores) as clf:
             logits = clf.forward(hidden_states=decoder_mems_list[-1][:, -1:])
-        return logits, decoder_mems_list
+
+        return logits, decoder_mems_list, xatt_scores_list
 
     def _prepare_for_search(self, decoder_input_ids=None, encoder_hidden_states=None):
         """
@@ -201,6 +204,7 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
         is_sampling = self.temperature is not None and self.n_samples > 1
 
         tgt, batch_size, max_generation_length = self._prepare_for_search(decoder_input_ids, encoder_hidden_states)
+        tgt_len = tgt.size(-1)
         if is_sampling:
             tgt = torch.repeat_interleave(tgt, self.n_samples, dim=0)
             encoder_hidden_states = torch.repeat_interleave(encoder_hidden_states, self.n_samples, dim=0)
@@ -227,9 +231,10 @@ class GreedySequenceGenerator(ConfidenceMethodMixin):
             if i == 0:
                 input_ids = tgt
             else:
+                i += tgt_len - 1
                 input_ids = tgt[:, -1:]
 
-            logits, decoder_mems_list = self._one_step_forward(
+            logits, decoder_mems_list, _ = self._one_step_forward(
                 input_ids,
                 encoder_hidden_states,
                 encoder_input_mask,
@@ -353,7 +358,7 @@ class TopKSequenceGenerator(GreedySequenceGenerator):
         pos=0,
         return_scores: bool = True,
     ):
-        log_probs, decoder_mems_list = super()._one_step_forward(
+        log_probs, decoder_mems_list, _ = super()._one_step_forward(
             decoder_input_ids,
             encoder_hidden_states,
             encoder_input_mask,
@@ -408,7 +413,9 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
         tgt, batch_size, max_generation_length = self._prepare_for_search(decoder_input_ids, encoder_hidden_states)
 
         # generate initial buffer of beam_size prefixes-hypotheses
-        log_probs, decoder_mems_list = self._one_step_forward(tgt, encoder_hidden_states, encoder_input_mask, None, 0)
+        log_probs, decoder_mems_list, _ = self._one_step_forward(
+            tgt, encoder_hidden_states, encoder_input_mask, None, 0
+        )
         scores, prefixes = torch.topk(log_probs.permute(0, 2, 1), self.beam_size, dim=1)
         scores, prefixes = scores.view(-1, 1), prefixes.view(-1, 1)
 
@@ -442,7 +449,7 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
             pad_mask = pad_profile.repeat(1, self.beam_size)
 
             # generate and score candidates for prefixes continuation
-            log_probs, decoder_mems_list = self._one_step_forward(
+            log_probs, decoder_mems_list, _ = self._one_step_forward(
                 prefixes[:, -1:], encoder_hidden_states, encoder_input_mask, decoder_mems_list, i
             )
             scores_i, prefixes_i = torch.topk(log_probs[:, -1, :], self.beam_size, dim=-1)
@@ -462,6 +469,175 @@ class BeamSearchSequenceGenerator(GreedySequenceGenerator):
             scores = scores / len_penalties
             scores, indices_i = torch.topk(scores.view(-1, self.beam_size**2), self.beam_size, dim=1)
             scores = scores.view(-1, 1) * len_penalties
+
+            # select prefixes which correspond to the chosen hypotheses
+            prefixes = prefixes.unsqueeze(1).repeat(1, self.beam_size, 1)
+            prefixes = torch.cat((prefixes, prefixes_i.unsqueeze(2)), dim=2)
+            prefixes = prefixes.view(batch_size, self.beam_size**2, -1)
+            p_len = prefixes.size(2)
+            prefixes_ids = indices_i.unsqueeze(2).repeat(1, 1, p_len)
+            prefixes = prefixes.gather(1, prefixes_ids).view(-1, p_len)
+
+            # reshuffle cached decoder memory states to restore the order
+            # of hypotheses broken after top-k selection
+            mems_ids = indices_i.unsqueeze(2).unsqueeze(3).repeat(1, 1, p_len - 1, hidden_size) // self.beam_size
+            for j in range(len(decoder_mems_list)):
+                decoder_mems_list[j] = (
+                    decoder_mems_list[j]
+                    .view(-1, self.beam_size, p_len - 1, hidden_size)
+                    .gather(1, mems_ids)
+                    .view(-1, p_len - 1, hidden_size)
+                )
+
+            # update prefixes_len and pad_profile
+            not_eos_pad = prefixes.ne(self.eos) & prefixes.ne(self.pad)
+            prefixes_len = 1 + not_eos_pad.sum(dim=1, keepdim=True).to(scores.dtype)
+            pad_profile = (~not_eos_pad[:, -1:]).long()
+
+            # if all hypotheses end with <eos> or <pad>, interrupt search
+            if pad_profile.sum() == batch_size * self.beam_size:
+                break
+
+        # select best performing hypotheses in each element of the batch
+        len_penalties = self.compute_len_penalty(prefixes_len, self.len_pen)
+        scores = scores / len_penalties
+        best_guesses = (
+            torch.argmax(scores.view(-1, self.beam_size), dim=1, keepdim=True).repeat(1, prefixes.size(1)).unsqueeze(1)
+        )
+        tgt = prefixes.view(batch_size, self.beam_size, -1).gather(1, best_guesses).squeeze(1)
+
+        if return_beam_scores:
+            return prefixes, scores * len_penalties, tgt
+        else:
+            return tgt
+
+
+class BeamSearchSequenceGeneratorWithFusionModels(BeamSearchSequenceGenerator):
+    def __init__(
+        self, embedding, decoder, log_softmax, fusion_models, fusion_models_alpha, beam_size=1, len_pen=0, **kwargs
+    ):
+        """
+        Beam Search sequence generator based on the decoder followed by
+        log_softmax.
+
+        Args:
+            *all args of BeamSearchSequenceGenerator class
+            ngram_lm_model: path to the n-gram language model; LM should use the same tokenizer as the current model
+            ngram_lm_alpha: n-gram LM weight
+        Kwargs:
+            all remaining parameters of BeamSearchSequenceGenerator class
+        """
+
+        super().__init__(embedding, decoder, log_softmax, beam_size=beam_size, len_pen=len_pen, **kwargs)
+
+        self.fusion_models = fusion_models
+        self.fusion_models_alpha = fusion_models_alpha
+
+    def _forward(
+        self, decoder_input_ids=None, encoder_hidden_states=None, encoder_input_mask=None, return_beam_scores=False
+    ):
+        device = encoder_hidden_states.device
+        # force fusion models to use the same device as encoder_hidden_states, since current class is not nn.Module instance
+        for fusion_model in self.fusion_models:
+            fusion_model.to(device)
+
+        tgt, batch_size, max_generation_length = self._prepare_for_search(decoder_input_ids, encoder_hidden_states)
+
+        batch_fusion_states_list = [
+            fusion_model.get_init_states(batch_size=batch_size, bos=True) for fusion_model in self.fusion_models
+        ]
+        batch_fusion_states_candidates_list = []
+
+        # generate initial buffer of beam_size prefixes-hypotheses
+        log_probs, decoder_mems_list, _ = self._one_step_forward(
+            tgt, encoder_hidden_states, encoder_input_mask, None, 0
+        )
+        # get fusion models scores
+        for fusion_model_idx, fusion_model in enumerate(self.fusion_models):
+            fusion_scores, batch_fusion_states_candidates = fusion_model.advance(
+                states=batch_fusion_states_list[fusion_model_idx], eos_id=self.eos
+            )
+            batch_fusion_states_candidates_list.append(batch_fusion_states_candidates)
+            log_probs += self.fusion_models_alpha[fusion_model_idx] * fusion_scores[:, None, :]
+
+        scores, prefixes = torch.topk(log_probs.permute(0, 2, 1), self.beam_size, dim=1)  # [Batch, Beam, 1]
+        for fusion_model_idx, batch_fusion_states_candidates in enumerate(batch_fusion_states_candidates_list):
+            batch_fusion_states_list[fusion_model_idx] = batch_fusion_states_candidates.gather(
+                dim=1, index=prefixes.squeeze(-1)
+            ).view(
+                -1
+            )  # [Batch, Beam] -> [Batch*Beam]
+
+        scores, prefixes = scores.view(-1, 1), prefixes.view(-1, 1)  # [Batch*Beam, 1]
+
+        # repeat init target prefixes and cached memory states beam_size times
+        prefixes = torch.cat((tgt.repeat(1, self.beam_size).view(-1, tgt.shape[1]), prefixes), dim=1)
+        for j in range(len(decoder_mems_list)):
+            decoder_mems_list[j] = decoder_mems_list[j].repeat(self.beam_size, 1, 1)
+
+        # repeat source sequence beam_size times for beam search
+        if encoder_hidden_states is not None:
+            _, src_length, hidden_size = encoder_hidden_states.size()
+            encoder_input_mask = encoder_input_mask.repeat(1, self.beam_size).view(-1, src_length)
+            encoder_hidden_states = encoder_hidden_states.repeat(1, self.beam_size, 1).view(
+                -1, src_length, hidden_size
+            )
+        else:
+            hidden_size = decoder_mems_list[0].size(2)
+
+        # pad_profile tracks finished hypotheses to generate only <pad> tokens
+        # if <eos> or <pad> has been generated
+        pad_profile = torch.zeros_like(scores).long()
+
+        # prefixes_len tracks lengths of generated hypotheses to perform
+        # length penalty correction
+        prefixes_len = torch.zeros_like(scores).fill_(prefixes.size(1) + 1)
+
+        tgt_len = tgt.size(-1)
+        for i in range(tgt_len, max_generation_length + tgt_len):
+
+            # mask all finished hypotheses to exclude them from beam
+            pad_mask = pad_profile.repeat(1, self.beam_size)
+
+            # generate and score candidates for prefixes continuation
+            log_probs, decoder_mems_list, _ = self._one_step_forward(
+                prefixes[:, -1:], encoder_hidden_states, encoder_input_mask, decoder_mems_list, i
+            )
+            for fusion_model_idx, fusion_model in enumerate(self.fusion_models):
+                fusion_scores, batch_fusion_states_candidates = fusion_model.advance(
+                    states=batch_fusion_states_list[fusion_model_idx], eos_id=self.eos
+                )
+                log_probs += self.fusion_models_alpha[fusion_model_idx] * fusion_scores[:, None, :]
+                batch_fusion_states_candidates_list[fusion_model_idx] = batch_fusion_states_candidates
+
+            scores_i, prefixes_i = torch.topk(log_probs[:, -1, :], self.beam_size, dim=-1)  # [Batch*Beam, Beam]
+
+            for fusion_model_idx, batch_fusion_states_candidates in enumerate(batch_fusion_states_candidates_list):
+                batch_fusion_states_list[fusion_model_idx] = batch_fusion_states_candidates.gather(
+                    dim=1, index=prefixes_i
+                )
+
+            # for all prefixes ending with <eos> or <pad> replace generated
+            # continuations with <pad>
+            prefixes_i = self.pad * pad_mask + prefixes_i * (1 - pad_mask)
+
+            # force all hypotheses but one generated from already finished
+            # hypotheses to have extremely low score, so they will not be
+            # considered during beam re-ranking
+            pad_mask[:, 1:] = pad_mask[:, 1:] * NEG_INF
+            scores = scores + scores_i * (1 - pad_mask).to(scores.dtype)
+
+            # choose top-k hypotheses with length penalty applied
+            len_penalties = self.compute_len_penalty(prefixes_len, self.len_pen)
+            scores = scores / len_penalties
+            scores, indices_i = torch.topk(scores.view(-1, self.beam_size**2), self.beam_size, dim=1)  # [Batch, Beam]
+
+            for fusion_model_idx, batch_fusion_states in enumerate(batch_fusion_states_list):
+                batch_fusion_states_list[fusion_model_idx] = (
+                    batch_fusion_states.view(-1, self.beam_size**2).gather(dim=1, index=indices_i).view(-1)
+                )
+
+            scores = scores.view(-1, 1) * len_penalties  # [Batch*Beam, 1]
 
             # select prefixes which correspond to the chosen hypotheses
             prefixes = prefixes.unsqueeze(1).repeat(1, self.beam_size, 1)
@@ -884,7 +1060,7 @@ class BeamSearchSequenceGeneratorWithLanguageModel(GreedySequenceGenerator):
         pos=0,
     ):
 
-        nmt_log_probs, decoder_mems_list = super()._one_step_forward(
+        nmt_log_probs, decoder_mems_list, _ = super()._one_step_forward(
             decoder_input_ids,
             encoder_hidden_states,
             encoder_input_mask,

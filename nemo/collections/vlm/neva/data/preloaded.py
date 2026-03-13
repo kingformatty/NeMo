@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,6 @@ import re
 import tarfile
 from typing import Any, Dict, List, Optional, Sequence
 
-import decord
 import lightning.pytorch as pl
 import numpy as np
 import torch
@@ -31,11 +30,16 @@ from torch.utils import data
 from torch.utils.data import DataLoader, Dataset, default_collate
 from transformers import CLIPImageProcessor, SiglipImageProcessor
 
-from nemo.collections.nlp.modules.common.megatron.utils import get_ltor_masks_and_position_ids
 from nemo.collections.vlm.neva.data.config import DataConfig, ImageDataConfig
 from nemo.collections.vlm.neva.data.conversation import conv_templates as supported_conv_templates
 from nemo.collections.vlm.neva.data.multimodal_tokens import IGNORE_INDEX, SPECIAL_TOKEN_MAP
 from nemo.lightning.pytorch.plugins import MegatronDataSampler
+from nemo.utils.megatron_utils import get_ltor_masks_and_position_ids
+
+try:
+    import decord
+except Exception:
+    logging.warning("The package `decord` was not installed in this environment.")
 
 
 class TarOrFolderImageLoader:
@@ -511,6 +515,10 @@ class NevaPreloadedDataModule(pl.LightningDataModule):
         num_image_embeddings_per_tile: int = 576,
         seed: int = 1234,
     ) -> None:
+        from nemo.lightning.callback_group import CallbackGroup
+
+        CallbackGroup.get_instance().on_dataloader_init_start()
+
         super().__init__()
         if not isinstance(paths, (list, tuple)):
             paths = [paths]
@@ -543,10 +551,11 @@ class NevaPreloadedDataModule(pl.LightningDataModule):
         if tokenizer is None or image_processor is None:
             logging.warning("Processor and tokenizer are not provided! Fall back to `llava-hf/llava-1.5-7b-hf`.")
             from transformers import AutoProcessor
+
             from nemo.collections.common.tokenizers.huggingface.auto_tokenizer import AutoTokenizer
 
             processor = AutoProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
-            self.tokenizer = tokenizer or AutoTokenizer("llava-hf/llava-1.5-7b-hf")
+            self.tokenizer = tokenizer or AutoTokenizer("llava-hf/llava-1.5-7b-hf", use_fast=False)
             self.image_processor = image_processor or processor.image_processor
 
         if self.packed_sequence:
@@ -570,6 +579,8 @@ class NevaPreloadedDataModule(pl.LightningDataModule):
             global_batch_size=global_batch_size,
             dataloader_type="cyclic",
         )
+
+        CallbackGroup.get_instance().on_dataloader_init_end()
 
     def setup(self, stage: str = "") -> None:
         assert len(self.paths) == 1, "not yet support blend dataset in Neva 2.0!"

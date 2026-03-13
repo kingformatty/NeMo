@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,12 +23,12 @@ from megatron.core.distributed import DistributedDataParallelConfig
 
 from nemo import lightning as nl
 from nemo.collections import llm
+from nemo.collections.common.tokenizers.tokenizer_utils import get_nmt_tokenizer
 from nemo.collections.llm.api import finetune, pretrain
 from nemo.collections.llm.gpt.data.mock import MockDataModule
 from nemo.collections.llm.recipes.log.default import default_log, default_resume, tensorboard_logger
 from nemo.collections.llm.recipes.optim.adam import distributed_fused_adam_with_cosine_annealing
 from nemo.collections.llm.recipes.precision.mixed_precision import bf16_mixed
-from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
 from nemo.utils.exp_manager import TimingCallback
 
 NAME = "mamba2_2_7b"
@@ -36,7 +36,9 @@ NAME = "mamba2_2_7b"
 
 @run.cli.factory(name=NAME)
 def tokenizer(tokenizer_model: str = None) -> run.Config[pl.LightningModule]:
-
+    """
+    Factory function to create a tokenizer configuration.
+    """
     return run.Config(
         get_nmt_tokenizer,
         library='huggingface',
@@ -63,7 +65,9 @@ def model(tokenizer_model: str = None) -> run.Config[pl.LightningModule]:
             >>> print(model_config)
     """
     return run.Config(
-        llm.GPTModel, config=run.Config(llm.BaseMambaConfig2_7B), tokenizer=tokenizer(tokenizer_model=tokenizer_model)
+        llm.MambaModel,
+        config=run.Config(llm.BaseMambaConfig2_7B),
+        tokenizer=tokenizer(tokenizer_model=tokenizer_model),
     )
 
 
@@ -199,10 +203,6 @@ def pretrain_recipe(
         Python API usage:
             >>> recipe = pretrain_recipe(name="mamba2_2_7b_pretrain", num_nodes=1)
             >>> print(recipe)
-
-    Note:
-        For more details on pre-training LLMs with NeMo, see the pre-training
-        guide in the `examples/llm/pretrain/` directory.
     """
     return run.Partial(
         fn,
@@ -278,12 +278,10 @@ def finetune_recipe(
             >>> print(recipe)
 
     Note:
-        This recipe uses the SQuAD dataset for fine-tuning. For more information
-        on fine-tuning LLMs with NeMo, see the fine-tuning guide in the
-        `examples/llm/finetune/` directory.
+        This recipe uses the SQuAD dataset for fine-tuning.
         For converting an SSM pytorch checkpoint, use the following line of python code:
 
-        llm.GPTModel(llm.BaseMambaConfig2_7B(), tokenizer=tokenizer()).import_ckpt(
+        llm.MambaModel(llm.BaseMambaConfig2_7B(), tokenizer=tokenizer()).import_ckpt(
             path="pytorch://ABSOLUTE_PATH_TO_CKPT/your_pytorch_state_dict_file",
             model_config=llm.BaseMambaConfig2_7B())
         This line will cache the nemo checkpoint to following directory:

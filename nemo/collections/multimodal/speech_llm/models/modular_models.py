@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,12 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# flake8: noqa
 
 import itertools
 import json
 import os
+from abc import ABC
 from functools import partial
-from typing import List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import hydra
 import sacrebleu
@@ -37,28 +40,36 @@ from nemo.collections.multimodal.speech_llm.data.build_dataset import (
     build_speechllm_dataloader,
     build_speechllm_dataset,
 )
-from nemo.collections.multimodal.speech_llm.modules.common.audio_text_generation_utils import generate
+
+if TYPE_CHECKING:
+    from nemo.collections.multimodal.speech_llm.modules.common.audio_text_generation_utils import generate
+
 from nemo.collections.multimodal.speech_llm.modules.perception_modules import (
     AudioPerceptionModule,
     MultiAudioPerceptionModule,
 )
 from nemo.collections.multimodal.speech_llm.parts.mixins.adapter_mixin import SpeechLLMAdapterMixin
 from nemo.collections.multimodal.speech_llm.parts.utils.data_utils import get_nested_dict_value
-from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
-from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
-from nemo.collections.nlp.modules.common.megatron.utils import (
-    average_losses_across_data_parallel_group,
-    build_position_ids,
-    get_iterator_k_split,
-)
-from nemo.collections.nlp.modules.common.text_generation_utils import get_computeprob_response
-from nemo.collections.nlp.parts.peft_config import PEFT_CONFIG_MAP
-from nemo.collections.nlp.parts.utils_funcs import get_last_rank
+
+try:
+    from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+    from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
+except (ImportError, ModuleNotFoundError):
+    MegatronGPTModel = ABC
+    MegatronGPTSFTModel = ABC
+
+from nemo.collections.multimodal.speech_llm.modules.common.text_generation_utils import get_computeprob_response
+from nemo.collections.multimodal.speech_llm.parts.peft_config import PEFT_CONFIG_MAP
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.core.classes.mixins import adapter_mixins
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, MaskType, NeuralType
 from nemo.utils import AppState, logging, model_utils
+from nemo.utils.megatron_utils import (
+    average_losses_across_data_parallel_group,
+    build_position_ids,
+    get_iterator_k_split,
+)
 from nemo.utils.model_utils import inject_model_parallel_rank
 
 try:
@@ -89,6 +100,10 @@ __all__ = ["ModularAudioGPTModel", "CrossAttendModularAudioGPTModel"]
 
 
 default_inference_config = {'tokens_to_generate': 30}
+
+
+def get_last_rank():
+    return torch.distributed.get_world_size() - 1
 
 
 class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
@@ -1446,6 +1461,9 @@ class ModularAudioGPTModel(SpeechLLMAdapterMixin, MegatronGPTSFTModel):
                 continue
             # Expand on_validation_epoch_end from parent class MegatronGPTModel as on_validation_epoch_end doesnt take outputs arg
             loss_vals = [x['loss'] for x in output]
+            assert (
+                self.cfg.get("virtual_pipeline_model_parallel_size", None) is None
+            ), "Virtual pipeline model parallel size is no longer supported for nemo 1.0"
             if parallel_state.is_pipeline_last_stage():
                 # only the last pipeline parallel stages return loss with their batch size
                 if self.cfg.data.get('validation_drop_last', True):
