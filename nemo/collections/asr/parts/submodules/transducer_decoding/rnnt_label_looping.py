@@ -1114,6 +1114,24 @@ class GreedyBatchedRNNTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBas
         # same as: self.active_mask_any = active_mask.any()
         torch.any(self.state.active_mask, out=self.state.active_mask_any)
 
+    def _apply_logit_bias(self, logits):
+        if getattr(self, 'logit_bias', None) is not None:
+            
+            # Option 1 (Add logits)
+            logits.add_(self.logit_bias)
+
+            # Option (Working Version)
+            # log_probs = F.log_softmax(logits, dim=-1)
+            # blank_log_prob = log_probs[:, self._blank_index].unsqueeze(1)  # [B, 1]
+            # punct_mask = self.logit_bias > 0  # [V] — True for punct tokens
+            # # Find the most likely punct token per batch item to anchor the group boost
+            # max_punct_log_prob = log_probs.masked_fill(~punct_mask, -1e9).max(dim=-1, keepdim=True).values
+            # # Bring the best punct token up to blank level, scaled by alpha; others shift by the same amount,
+            # # preserving relative ordering among punct tokens
+            # group_boost = (blank_log_prob - max_punct_log_prob).clamp(min=0) * self.logit_bias.max()
+            # logits.add_(group_boost * punct_mask.float())
+
+
     def _before_inner_loop_get_joint_output(self):
         """Get Joint output after decoder output, prepare inner loop to search for all next non-blank labels"""
         # stage 1: get joint output, iteratively seeking for non-blank labels
@@ -1128,6 +1146,7 @@ class GreedyBatchedRNNTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBas
             .squeeze(1)
             .squeeze(1)
         )
+        self._apply_logit_bias(logits)
         # same as: scores, labels = logits.max(-1)
         torch.max(logits, dim=-1, out=(self.state.scores, self.state.labels))
 
@@ -1199,6 +1218,7 @@ class GreedyBatchedRNNTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBas
             .squeeze(1)
             .squeeze(1)
         )
+        self._apply_logit_bias(logits)
         # get labels (greedy) and scores from current logits, replace labels/scores with new
         # labels[advance_mask] are blank, and we are looking for non-blank labels
         more_scores, more_labels = logits.max(-1)

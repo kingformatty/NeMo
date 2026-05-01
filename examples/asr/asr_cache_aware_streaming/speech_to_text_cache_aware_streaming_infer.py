@@ -186,6 +186,11 @@ class TranscriptionConfig:
     # use_cer: bool = False
     debug_mode: bool = False  # Whether to print more detail in the output.
 
+    # Punctuation Strategies.
+    compute_punct_delay: bool = False  # Whether to compute the punct delay. Flag this won't change how inference works, but only affects the output.
+    punct_bias_tokens: Optional[list] = None  # The tokens to apply the bias to. Bias will only be applied to these tokens.
+    punct_bias: Optional[float] = None  # The bias for the punctuation tokens. Bias will only be applied to the tokens in punct_bias_tokens.
+
 
 def extract_transcriptions(hyps):
     """
@@ -216,6 +221,9 @@ def perform_streaming(
     compare_vs_offline=False,
     debug_mode=False,
     pad_and_drop_preencoded=False,
+    compute_punct_delay=False,
+    punct_bias_tokens=None,
+    punct_bias=None,
 ):
     batch_size = len(streaming_buffer.streams_length)
     if compare_vs_offline:
@@ -249,7 +257,31 @@ def perform_streaming(
     previous_hypotheses = None
     streaming_buffer_iter = iter(streaming_buffer)
     pred_out_stream = None
+    if punct_bias_tokens is not None and punct_bias is not None:
+        # Resolve decoding_computer for dynamic punctuation bias
+        _decoding_computer = None
+        _punct_ids = None
+        _punct_ids_set = None
+        decoded_since_last_punct = []  # accumulates non-punct token ids; bias only increments when non-empty
+        if hasattr(asr_model, 'decoding') and hasattr(asr_model.decoding, 'decoding'):
+            _dc = getattr(asr_model.decoding.decoding, 'decoding_computer', None)
+            if _dc is not None and getattr(_dc, 'logit_bias', None) is not None:
+                _decoding_computer = _dc
+                _punct_ids = [asr_model.tokenizer.token_to_id(p) for p in punct_bias_tokens]
+                _punct_ids_set = set(_punct_ids)
+    else:
+        _decoding_computer = None
+        _punct_ids = None
+        _punct_ids_set = None
+
     for step_num, (chunk_audio, chunk_lengths) in enumerate(streaming_buffer_iter):
+        # Snapshot hypothesis lengths before this step to detect new tokens
+        prev_hyp_lengths = (
+            [len(h.y_sequence) if h is not None else 0 for h in previous_hypotheses]
+            if previous_hypotheses is not None
+            else None
+        )
+
         with torch.inference_mode():
             # keep_all_outputs needs to be True for the last step of streaming when model is trained with att_context_style=regular
             # otherwise the last outputs would get dropped
@@ -275,8 +307,85 @@ def perform_streaming(
                     return_transcription=True,
                 )
 
+        # Update punctuation logit bias dynamically using decoded_since_last_punct
+        if _decoding_computer is not None:
+            cur_hyp_lengths = [len(h.y_sequence) if h is not None else 0 for h in previous_hypotheses]
+            prev_lengths = prev_hyp_lengths if prev_hyp_lengths is not None else [0] * len(cur_hyp_lengths)
+
+            new_punct_tokens = []
+            new_nonpunct_tokens = []
+            for h, prev_len in zip(previous_hypotheses, prev_lengths):
+                if h is None:
+                    continue
+                y_seq = h.y_sequence
+                new_toks = y_seq[prev_len:].tolist() if hasattr(y_seq, 'tolist') else list(y_seq[prev_len:])
+                for tok in new_toks:
+                    if tok in _punct_ids_set:
+                        new_punct_tokens.append(tok)
+                    else:
+                        new_nonpunct_tokens.append(tok)
+
+            if new_punct_tokens:
+                # Punct predicted: clear buffer and reset bias
+                decoded_since_last_punct.clear()
+                _decoding_computer.logit_bias.zero_()
+            elif new_nonpunct_tokens:
+                # Non-blank non-punct tokens: add to buffer and reset bias
+                decoded_since_last_punct.extend(new_nonpunct_tokens)
+                _decoding_computer.logit_bias.zero_()
+            elif decoded_since_last_punct:
+                # No new tokens, but buffer has prior words: increment punct bias
+                for pid in _punct_ids:
+                    _decoding_computer.logit_bias[pid] += 2.5
+            # ### Print ###
+            # # Print out accumulated transcription for each sample in the batch at each step, indexed by step_num
+            # is_final = streaming_buffer.is_buffer_empty()
+            # for sample_idx_in_batch in range(len(transcribed_texts)):
+            #     tran_scr = extract_transcriptions([transcribed_texts[sample_idx_in_batch]])[0]
+            #     print(
+            #         f"Step {step_num} (final={is_final}), Sample {sample_idx_in_batch} "
+            #         f"(chunk_len={int(chunk_lengths[sample_idx_in_batch])})"
+            #     )
+            #     print(f"{tran_scr}")
+            # # Convert the contents of decoded_since_last_punct from token ids to tokens for display
+            # if len(decoded_since_last_punct) > 0 and hasattr(asr_model, "tokenizer"):
+            #     buffer_tokens = asr_model.tokenizer.ids_to_tokens(list(decoded_since_last_punct))
+            # else:
+            #     buffer_tokens = list(decoded_since_last_punct)
+            # print(f"decoded_since_last_punct (tokens): {buffer_tokens}")
+            # # Print logit_bias values for punctuation ids as token: score
+            # if _decoding_computer is not None:
+            #     punct_scores = []
+            #     for pid in _punct_ids:
+            #         tok = asr_model.tokenizer.ids_to_tokens([pid])[0]
+            #         score = float(_decoding_computer.logit_bias[pid].item())
+            #         punct_scores.append(f'"{tok}": {score}')
+            #     print("logit_bias punctuations:", ", ".join(punct_scores))
+            # print("--------------------------------")
+
         if debug_mode:
             logging.info(f"Streaming transcriptions: {extract_transcriptions(transcribed_texts)}")
+
+    if compute_punct_delay:
+        # print alignment information
+        final_punct_delay = []
+        for sample_idx_in_batch in range(len(transcribed_texts)):
+            punct_delay = []
+            for i in range(len(transcribed_texts[sample_idx_in_batch].y_sequence)):
+                cur_token = asr_model.tokenizer.ids_to_tokens([int(transcribed_texts[sample_idx_in_batch].y_sequence[i])])
+                cur_stamp = transcribed_texts[sample_idx_in_batch].timestamp[i]
+                
+                # logging.info(f"{cur_token} : {cur_stamp}")
+                if cur_token[0] in [',', '.', '?', '<EOU>']:
+                    # logging.info('**********************')
+                    if i > 0:
+                        punct_delay.append(int(cur_stamp - transcribed_texts[sample_idx_in_batch].timestamp[i-1]))
+            if len(punct_delay) > 0:
+                final_punct_delay.append(punct_delay)
+            else:
+                final_punct_delay.append(None)
+    else:
+        final_punct_delay = None
 
     final_streaming_tran = extract_transcriptions(transcribed_texts)
     logging.info(f"Final streaming transcriptions: {final_streaming_tran}")
@@ -296,7 +405,7 @@ def perform_streaming(
                 f"The shape of the outputs of the model in streaming mode ({pred_out_stream_cat.size()}) is different from offline mode ({pred_out_offline_cat.size()})."
             )
 
-    return final_streaming_tran, final_offline_tran
+    return final_streaming_tran, final_offline_tran, final_punct_delay
 
 
 @hydra_runner(config_name="TranscriptionConfig", schema=TranscriptionConfig)
@@ -365,6 +474,17 @@ def main(cfg: TranscriptionConfig):
 
     asr_model = asr_model.to(device=device, dtype=compute_dtype)
     asr_model.eval()
+    # Apply logit bias to encourage punctuation tokens over blank in RNN-T decoding
+    if cfg.punct_bias_tokens is not None and cfg.punct_bias is not None and hasattr(asr_model, 'decoding') and hasattr(asr_model.decoding, 'decoding'):
+        decoding_inner = asr_model.decoding.decoding
+        decoding_computer = getattr(decoding_inner, 'decoding_computer', None)
+        if decoding_computer is not None:
+            punct_ids = [asr_model.tokenizer.token_to_id(p) for p in cfg.punct_bias_tokens]
+            bias = torch.zeros(decoding_computer._blank_index + 1, device=device)
+            for pid in punct_ids:
+                bias[pid] = 0 # start from 0
+            decoding_computer.logit_bias = bias
+        logging.info(f"Applied logit bias to encourage punctuation tokens over blank in RNN-T decoding: {cfg.punct_bias_tokens} with bias {cfg.punct_bias}")
 
     # chunk_size is set automatically for models trained for streaming. For models trained for offline mode with full context, we need to pass the chunk_size explicitly.
     if cfg.chunk_size > 0:
@@ -396,6 +516,7 @@ def main(cfg: TranscriptionConfig):
         online_normalization=online_normalization,
         pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
     )
+
     with torch.amp.autocast('cuda' if device.type == "cuda" else "cpu", dtype=amp_dtype, enabled=cfg.amp):
         if cfg.audio_file is not None:
             # stream a single audio file
@@ -406,12 +527,17 @@ def main(cfg: TranscriptionConfig):
                 compute_dtype=compute_dtype,
                 compare_vs_offline=cfg.compare_vs_offline,
                 pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
+                compute_punct_delay=cfg.compute_punct_delay,
+                punct_bias_tokens=cfg.punct_bias_tokens,
+                punct_bias=cfg.punct_bias,
             )
         else:
             # stream audio files in a manifest file in batched mode
+            all_audio_filepaths = []
             all_streaming_tran = []
             all_offline_tran = []
             all_refs_text = []
+            all_punct_delay = []
             batch_size = cfg.batch_size
 
             if cfg.dataset_manifest is not None:
@@ -440,21 +566,29 @@ def main(cfg: TranscriptionConfig):
                 _ = streaming_buffer.append_audio_file(sample['audio_filepath'], stream_id=-1)
                 if "text" in sample:
                     all_refs_text.append(sample["text"])
+                all_audio_filepaths.append(sample['audio_filepath'])
                 logging.info(f'Added this sample to the buffer: {sample["audio_filepath"]}')
 
                 if (sample_idx + 1) % batch_size == 0 or sample_idx == len(samples) - 1:
                     logging.info(
                         f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}..."
                     )
-                    streaming_tran, offline_tran = perform_streaming(
+                    streaming_tran, offline_tran, final_punct_delay = perform_streaming(
                         asr_model=asr_model,
                         streaming_buffer=streaming_buffer,
                         compute_dtype=compute_dtype,
                         compare_vs_offline=cfg.compare_vs_offline,
                         debug_mode=cfg.debug_mode,
                         pad_and_drop_preencoded=cfg.pad_and_drop_preencoded,
+                        compute_punct_delay=cfg.compute_punct_delay,
+                        punct_bias_tokens=cfg.punct_bias_tokens,
+                        punct_bias=cfg.punct_bias,
                     )
                     all_streaming_tran.extend(streaming_tran)
+                    if cfg.compute_punct_delay:
+                        all_punct_delay.extend(final_punct_delay)
+                    else:
+                        all_punct_delay.extend([None] * len(streaming_tran))
                     if cfg.compare_vs_offline:
                         all_offline_tran.extend(offline_tran)
                     streaming_buffer.reset_buffer()
@@ -469,6 +603,21 @@ def main(cfg: TranscriptionConfig):
         end_time = time.time()
         logging.info(f"The whole streaming process took: {round(end_time - start_time, 2)}s")
 
+        # write average punct delay to logging
+        if cfg.compute_punct_delay:
+            # Compute the average punct delay, skipping any None elements in all_punct_delay.
+            # all_punct_delay is a list of list[int] or None.
+            punct_delays_flat = [delay for sublist in all_punct_delay if sublist is not None for delay in sublist]
+            if punct_delays_flat:
+                avg_punct_delay = round(sum(punct_delays_flat) / len(punct_delays_flat), 2)
+                cnt = 0
+                for punct_delay in all_punct_delay:
+                    if punct_delay is not None:
+                        cnt += 1
+                logging.info(f"Ratio% of sample has punctuation predicted: {round(cnt / len(all_punct_delay), 2)}")
+                logging.info(f"Average punct delay: {avg_punct_delay}")
+            else:
+                logging.info(f"Average punct delay: None (no valid punct delays found)")
         # stores the results including the transcriptions of the streaming inference in a json file
         if cfg.output_path is not None and len(all_refs_text) == len(all_streaming_tran):
             fname = "streaming_out_" + os.path.splitext(os.path.basename(model_name))[0] + f"_{dataset_title}.json"
@@ -480,7 +629,11 @@ def main(cfg: TranscriptionConfig):
                     record = {
                         "pred_text": hyp,
                         "text": all_refs_text[i],
+                        "audio_filepath": all_audio_filepaths[i],
                         "wer": round(word_error_rate(hypotheses=[hyp], references=[all_refs_text[i]]) * 100, 2),
+                        "punct_delay": all_punct_delay[i] if all_punct_delay[i] is not None else None,
+                        "num_punct_delay": len(all_punct_delay[i]) if all_punct_delay[i] is not None else None,
+                        "avg_punct_delay": round(sum(all_punct_delay[i]) / len(all_punct_delay[i]), 2) if all_punct_delay[i] is not None else None,
                     }
                     out_f.write(json.dumps(record) + '\n')
 
