@@ -1116,9 +1116,15 @@ class GreedyBatchedRNNTLabelLoopingComputer(GreedyBatchedLabelLoopingComputerBas
 
     def _apply_logit_bias(self, logits):
         if getattr(self, 'logit_bias', None) is not None:
-            
+
             # Option 1 (Add logits)
-            logits.add_(self.logit_bias)
+            if self.logit_bias.dim() == 1:
+                logits.add_(self.logit_bias)
+            else:
+                # Per-sample [MAX_B, V] bias. Slice by logits rows: handles torch_impl where
+                # the last partial batch has logits.shape[0] < MAX_B, while cuda_graphs_impl
+                # always has logits.shape[0] == MAX_B (cached state), so no slice happens.
+                logits.add_(self.logit_bias[:logits.shape[0]])
 
             # Option (Working Version)
             # log_probs = F.log_softmax(logits, dim=-1)

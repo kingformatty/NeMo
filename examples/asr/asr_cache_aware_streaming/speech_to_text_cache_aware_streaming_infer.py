@@ -103,7 +103,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import lightning.pytorch as pl
 import torch
@@ -189,7 +189,7 @@ class TranscriptionConfig:
     # Punctuation Strategies.
     compute_punct_delay: bool = False  # Whether to compute the punct delay. Flag this won't change how inference works, but only affects the output.
     punct_bias_tokens: Optional[list] = None  # The tokens to apply the bias to. Bias will only be applied to these tokens.
-    punct_bias: Optional[float] = None  # The bias for the punctuation tokens. Bias will only be applied to the tokens in punct_bias_tokens.
+    punct_bias: Optional[Any] = None  # Per-step bias increment for punct tokens. A single float applies the same increment to all tokens; a list applies per-token increments matching punct_bias_tokens.
 
 
 def extract_transcriptions(hyps):
@@ -262,13 +262,15 @@ def perform_streaming(
         _decoding_computer = None
         _punct_ids = None
         _punct_ids_set = None
-        decoded_since_last_punct = []  # accumulates non-punct token ids; bias only increments when non-empty
+        word_accumulator = [[] for _ in range(batch_size)]  # per-sample non-punct token accumulator
         if hasattr(asr_model, 'decoding') and hasattr(asr_model.decoding, 'decoding'):
             _dc = getattr(asr_model.decoding.decoding, 'decoding_computer', None)
             if _dc is not None and getattr(_dc, 'logit_bias', None) is not None:
                 _decoding_computer = _dc
                 _punct_ids = [asr_model.tokenizer.token_to_id(p) for p in punct_bias_tokens]
                 _punct_ids_set = set(_punct_ids)
+                _punct_bias_map = {pid: inc for pid, inc in zip(_punct_ids, list(punct_bias))}
+                _dc.logit_bias.zero_()  # reset in-place to preserve tensor identity for CUDA graph
     else:
         _decoding_computer = None
         _punct_ids = None
@@ -307,36 +309,31 @@ def perform_streaming(
                     return_transcription=True,
                 )
 
-        # Update punctuation logit bias dynamically using decoded_since_last_punct
+        # Update punctuation logit bias dynamically, per sample
         if _decoding_computer is not None:
             cur_hyp_lengths = [len(h.y_sequence) if h is not None else 0 for h in previous_hypotheses]
             prev_lengths = prev_hyp_lengths if prev_hyp_lengths is not None else [0] * len(cur_hyp_lengths)
 
-            new_punct_tokens = []
-            new_nonpunct_tokens = []
-            for h, prev_len in zip(previous_hypotheses, prev_lengths):
+            for i, (h, prev_len) in enumerate(zip(previous_hypotheses, prev_lengths)):
                 if h is None:
                     continue
                 y_seq = h.y_sequence
                 new_toks = y_seq[prev_len:].tolist() if hasattr(y_seq, 'tolist') else list(y_seq[prev_len:])
-                for tok in new_toks:
-                    if tok in _punct_ids_set:
-                        new_punct_tokens.append(tok)
-                    else:
-                        new_nonpunct_tokens.append(tok)
+                new_punct = [t for t in new_toks if t in _punct_ids_set]
+                new_nonpunct = [t for t in new_toks if t not in _punct_ids_set]
 
-            if new_punct_tokens:
-                # Punct predicted: clear buffer and reset bias
-                decoded_since_last_punct.clear()
-                _decoding_computer.logit_bias.zero_()
-            elif new_nonpunct_tokens:
-                # Non-blank non-punct tokens: add to buffer and reset bias
-                decoded_since_last_punct.extend(new_nonpunct_tokens)
-                _decoding_computer.logit_bias.zero_()
-            elif decoded_since_last_punct:
-                # No new tokens, but buffer has prior words: increment punct bias
-                for pid in _punct_ids:
-                    _decoding_computer.logit_bias[pid] += 2.5
+                if new_punct:
+                    # Punct predicted: clear word accumulator and reset bias for this sample
+                    word_accumulator[i].clear()
+                    _decoding_computer.logit_bias[i].zero_()
+                elif new_nonpunct:
+                    # Non-punct tokens decoded: add to word accumulator and reset bias for this sample
+                    word_accumulator[i].extend(new_nonpunct)
+                    _decoding_computer.logit_bias[i].zero_()
+                elif word_accumulator[i]:
+                    # No new tokens, but word accumulator is non-empty: increment punct bias for this sample
+                    for pid in _punct_ids:
+                        _decoding_computer.logit_bias[i][pid] += _punct_bias_map[pid]
             # ### Print ###
             # # Print out accumulated transcription for each sample in the batch at each step, indexed by step_num
             # is_final = streaming_buffer.is_buffer_empty()
@@ -347,18 +344,18 @@ def perform_streaming(
             #         f"(chunk_len={int(chunk_lengths[sample_idx_in_batch])})"
             #     )
             #     print(f"{tran_scr}")
-            # # Convert the contents of decoded_since_last_punct from token ids to tokens for display
-            # if len(decoded_since_last_punct) > 0 and hasattr(asr_model, "tokenizer"):
-            #     buffer_tokens = asr_model.tokenizer.ids_to_tokens(list(decoded_since_last_punct))
+            # # Convert the contents of word_accumulator[0] from token ids to tokens for display (sample 0)
+            # if len(word_accumulator[0]) > 0 and hasattr(asr_model, "tokenizer"):
+            #     acc_tokens = asr_model.tokenizer.ids_to_tokens(list(word_accumulator[0]))
             # else:
-            #     buffer_tokens = list(decoded_since_last_punct)
-            # print(f"decoded_since_last_punct (tokens): {buffer_tokens}")
-            # # Print logit_bias values for punctuation ids as token: score
+            #     acc_tokens = list(word_accumulator[0])
+            # print(f"word_accumulator[0] (tokens): {acc_tokens}")
+            # # Print logit_bias values for punctuation ids as token: score (sample 0)
             # if _decoding_computer is not None:
             #     punct_scores = []
             #     for pid in _punct_ids:
             #         tok = asr_model.tokenizer.ids_to_tokens([pid])[0]
-            #         score = float(_decoding_computer.logit_bias[pid].item())
+            #         score = float(_decoding_computer.logit_bias[0][pid].item())
             #         punct_scores.append(f'"{tok}": {score}')
             #     print("logit_bias punctuations:", ", ".join(punct_scores))
             # print("--------------------------------")
@@ -479,11 +476,8 @@ def main(cfg: TranscriptionConfig):
         decoding_inner = asr_model.decoding.decoding
         decoding_computer = getattr(decoding_inner, 'decoding_computer', None)
         if decoding_computer is not None:
-            punct_ids = [asr_model.tokenizer.token_to_id(p) for p in cfg.punct_bias_tokens]
-            bias = torch.zeros(decoding_computer._blank_index + 1, device=device)
-            for pid in punct_ids:
-                bias[pid] = 0 # start from 0
-            decoding_computer.logit_bias = bias
+            vocab_size = decoding_computer._blank_index + 1
+            decoding_computer.logit_bias = torch.zeros(cfg.batch_size, vocab_size, device=device)
         logging.info(f"Applied logit bias to encourage punctuation tokens over blank in RNN-T decoding: {cfg.punct_bias_tokens} with bias {cfg.punct_bias}")
 
     # chunk_size is set automatically for models trained for streaming. For models trained for offline mode with full context, we need to pass the chunk_size explicitly.
