@@ -471,6 +471,7 @@ def write_transcription(
     compute_langs: bool = False,
     timestamps: bool = False,
     confidence: bool = False,
+    strip_lang_tags: bool = False,
 ) -> Tuple[str, str]:
     """Write generated transcription to output file."""
     if cfg.append_pred:
@@ -482,6 +483,11 @@ def write_transcription(
         pred_text_attr_name = 'pred_text_' + pred_by_model_name
     else:
         pred_text_attr_name = 'pred_text'
+
+    _LANG_TAG_RE = re.compile(r'<[a-zA-Z]{2,3}-[a-zA-Z]{2,3}>')
+
+    def _maybe_strip(text: str) -> str:
+        return _LANG_TAG_RE.sub('', text).strip() if strip_lang_tags else text
 
     return_hypotheses = True
     if isinstance(transcriptions[0], str):  # List[str]:
@@ -511,9 +517,9 @@ def write_transcription(
         if cfg.audio_dir is not None:
             for idx, transcription in enumerate(best_hyps):  # type: rnnt_utils.Hypothesis or str
                 if not return_hypotheses:  # transcription is str
-                    item = {'audio_filepath': filepaths[idx], pred_text_attr_name: transcription}
+                    item = {'audio_filepath': filepaths[idx], pred_text_attr_name: _maybe_strip(transcription)}
                 else:  # transcription is Hypothesis
-                    item = {'audio_filepath': filepaths[idx], pred_text_attr_name: transcription.text}
+                    item = {'audio_filepath': filepaths[idx], pred_text_attr_name: _maybe_strip(transcription.text)}
 
                     if timestamps:
                         timestamps = transcription.timestamp
@@ -545,9 +551,9 @@ def write_transcription(
                         continue
                     item = json.loads(line)
                     if not return_hypotheses:  # transcription is str
-                        item[pred_text_attr_name] = best_hyps[idx]
+                        item[pred_text_attr_name] = _maybe_strip(best_hyps[idx])
                     else:  # transcription is Hypothesis
-                        item[pred_text_attr_name] = best_hyps[idx].text
+                        item[pred_text_attr_name] = _maybe_strip(best_hyps[idx].text)
 
                         if timestamps:
                             timestamps = best_hyps[idx].timestamp

@@ -245,6 +245,12 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             pin_memory=config.get('pin_memory', False),
         )
 
+    def _transcribe_input_manifest_processing(self, audio_files, temp_dir, trcfg):
+        ds_config = super()._transcribe_input_manifest_processing(audio_files, temp_dir, trcfg)
+        if hasattr(trcfg, 'target_lang'):
+            ds_config['target_lang'] = trcfg.target_lang
+        return ds_config
+
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
         """
         Setup function for a temporary data loader which wraps the provided audio file.
@@ -289,6 +295,7 @@ class EncDecHybridRNNTCTCBPEModelWithPrompt(PromptStreamingMixin, EncDecHybridRN
             'num_prompts': self.cfg.model_defaults.get('num_prompts', 128),
             'subsampling_factor': self.cfg.get('subsampling_factor', 8),
             'default_lang': target_lang,
+            'default_prompt_mode': 'langID',
             'window_stride': self.cfg.preprocessor.get('window_stride', 0.01),
         }
 

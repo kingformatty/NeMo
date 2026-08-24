@@ -119,20 +119,21 @@ class LhotseSpeechToTextBpeDatasetWithPromptIndex(torch.utils.data.Dataset):
                         otherwise the real language ID
         """
         mode = self._get_prompt_mode(cut)
+        lang = (cut.supervisions[0].language if cut.supervisions else None) or self.cfg.get('default_lang')
 
         if mode == 'langID':
-            return self._get_prompt_index(cut.supervisions[0].language)
+            return self._get_prompt_index(lang) if lang else self.auto_index
         elif mode == 'auto':
             return self.auto_index
         elif mode == 'unified':
             if random.random() < self.unified_auto_ratio:
                 return self.auto_index
-            return self._get_prompt_index(cut.supervisions[0].language)
+            return self._get_prompt_index(lang) if lang else self.auto_index
         else:
             logging.warning(f"Unknown prompt_mode '{mode}', falling back to unified")
             if random.random() < self.unified_auto_ratio:
                 return self.auto_index
-            return self._get_prompt_index(cut.supervisions[0].language)
+            return self._get_prompt_index(lang) if lang else self.auto_index
 
     def __getitem__(self, cuts) -> Tuple[torch.Tensor, ...]:
         audio, audio_lens, cuts = self.load_audio(cuts)

@@ -209,6 +209,10 @@ class TranscriptionConfig:
 
     confidence: bool = False  # output token and word confidence in the manifest
 
+    strip_lang_tags: bool = False  # remove <xx-XX> language tags from pred_text (e.g. <en-US>)
+
+    target_lang: Optional[str] = None  # target language for prompted models (e.g. en-US, es-US)
+
     calculate_rtfx: bool = False
     warmup_steps: int = 0  # by default - no warmup
     run_steps: int = 1  # by default - single run
@@ -419,6 +423,8 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
             override_cfg.timestamps = cfg.timestamps
             if hasattr(override_cfg, "prompt"):
                 override_cfg.prompt = parse_multitask_prompt(OmegaConf.to_container(cfg.prompt))
+            if hasattr(override_cfg, "target_lang") and cfg.target_lang is not None:
+                override_cfg.target_lang = cfg.target_lang
 
             device = next(asr_model.parameters()).device
             for run_step in range(cfg.warmup_steps + cfg.run_steps):
@@ -474,6 +480,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
         compute_langs=compute_langs,
         timestamps=cfg.timestamps,
         confidence=cfg.confidence,
+        strip_lang_tags=cfg.strip_lang_tags,
     )
     logging.info(f"Finished writing predictions to {output_filename}!")
 
